@@ -1,6 +1,0 @@
-streamlit>=1.36
-sqlmodel>=0.0.20
-sqlalchemy>=2.0
-pandas>=2.2
-python-dateutil>=2.9
-psycopg[binary]>=3.2
