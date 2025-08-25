@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os
+import os, math
 from datetime import date, datetime
 from typing import Any, Dict, Optional, List, Tuple
 
@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import (
     create_engine, MetaData, Table, select, insert, update, delete,
-    text, and_, or_
+    text, or_
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
@@ -15,10 +15,15 @@ from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
 # ---------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------
-st.set_page_config(page_title="Gestão da Turma de Muay Thai", page_icon="🥊", layout="wide")
+st.set_page_config(page_title="JAT - Gestão de alunos", page_icon="🥊", layout="wide")
 
-DB_URL = st.secrets.get("DATABASE_URL") or os.getenv("DATABASE_URL") or f"sqlite:///{os.path.join(os.path.dirname(__file__), 'muaythai.db')}"
+DB_URL = (
+    st.secrets.get("DATABASE_URL")
+    or os.getenv("DATABASE_URL")
+    or f"sqlite:///{os.path.join(os.path.dirname(__file__), 'muaythai.db')}"
+)
 
+# nomes (ajuste aqui se forem outros)
 T_STUDENT     = "student"
 T_GRADUATION  = "graduation_history"
 T_PAYMENT     = "payment"
@@ -27,10 +32,8 @@ T_SETTINGS    = "settings"
 T_COACH       = "coach"
 T_SLOT        = "train_slot"
 
-BIRTH_MIN = date(1900, 1, 1)
-BIRTH_MAX = date.today()
-TRAIN_MIN = date(1990, 1, 1)
-TRAIN_MAX = date.today()
+BIRTH_MIN, BIRTH_MAX = date(1900,1,1), date.today()
+TRAIN_MIN, TRAIN_MAX = date(1990,1,1), date.today()
 
 GRADE_CHOICES = [
     "Branca","Amarelo","Amarelo e Branca","Verde","Verde e Branca",
@@ -58,16 +61,12 @@ def has_col(tbl: Optional[Table], col: str) -> bool:
     return (tbl is not None) and (col in tbl.c)
 
 def clear_data_cache():
-    try:
-        fetch_students_df.clear()
-        fetch_grads_df.clear()
-        fetch_payments_df.clear()
-        fetch_extras_df.clear()
-        get_settings.clear()
-        get_coaches_df.clear()
-        get_slots_df.clear()
-    except Exception:
-        pass
+    for fn in (
+        fetch_students_df, fetch_grads_df, fetch_payments_df, fetch_extras_df,
+        get_settings, get_coaches_df, get_slots_df
+    ):
+        try: fn.clear()
+        except Exception: pass
 
 # ---------------------------------------------------------
 # HELPERS
@@ -103,10 +102,8 @@ def tempo_treino_fmt(dt_inicio: Any) -> str:
     months = (today.year - di.year) * 12 + (today.month - di.month)
     if today.day < di.day: months -= 1
     if months < 0: months = 0
-    anos = months // 12
-    meses = months % 12
-    if anos > 0: return f"{anos} anos e {meses} meses" if meses else f"{anos} anos"
-    return f"{meses} meses"
+    anos, meses = months // 12, months % 12
+    return f"{anos} anos e {meses} meses" if anos > 0 else f"{meses} meses"
 
 def money(v: Any) -> str:
     try: f = float(v or 0)
@@ -180,18 +177,18 @@ def get_slots_df() -> pd.DataFrame:
 def compute_share_and_percent(student_row: Dict[str, Any], amount: float) -> Tuple[float, float]:
     """Retorna (repasse_em_reais, percentual_usado 0..1)."""
     try:
-        # full pass?
+        # 100% por professor?
         if "coach_id" in student_row and student_row.get("coach_id") is not None:
             dfc = get_coaches_df()
             if not dfc.empty and "id" in dfc.columns:
                 row = dfc[dfc["id"] == student_row["coach_id"]]
                 if not row.empty and "full_pass" in row.columns and bool(row.iloc[0].get("full_pass", False)):
                     return float(amount), 1.0
-        # override aluno?
-        if student_row.get("master_percent_override") is not None:
+        # Override aluno?
+        if student_row.get("master_percent_override") is not None and not (isinstance(student_row.get("master_percent_override"), float) and math.isnan(student_row.get("master_percent_override"))):
             p = float(student_row["master_percent_override"])
             return float(amount) * p, p
-        # settings?
+        # Settings?
         cfg = get_settings()
         if cfg.get("master_percent") is not None:
             p = float(cfg["master_percent"])
@@ -249,22 +246,32 @@ def fetch_students_df() -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty: return df
 
+    # derivados
     if "birth_date" in df.columns: df["Idade"] = df["birth_date"].apply(idade_atual)
     else: df["Idade"] = "—"
     if "start_date" in df.columns: df["Tempo de treino"] = df["start_date"].apply(tempo_treino_fmt)
     else: df["Tempo de treino"] = "—"
 
+    # graduação atual
     gh = reflect_table(T_GRADUATION)
     if gh is not None and "id" in df.columns:
-        with engine.begin() as conn:
-            grads = conn.execute(text(f"""
-                SELECT DISTINCT ON (student_id) student_id, grade, date
-                FROM {T_GRADUATION}
-                ORDER BY student_id, date DESC, id DESC
-            """)).mappings().all()
-        gmap = {r["student_id"]: (r["grade"], r["date"]) for r in grads}
-        df["Graduação"] = df["id"].map(lambda i: gmap.get(i, ("Branca", None))[0])
-        df["Data Graduação"] = df["id"].map(lambda i: fmt_date(gmap.get(i, (None, None))[1]))
+        # pega última por data
+        date_cols = [c for c in ["date","grade_date","created_at"] if has_col(gh, c)]
+        dcol = date_cols[0] if date_cols else None
+        grade_col = "grade" if has_col(gh,"grade") else ("graduation" if has_col(gh,"graduation") else None)
+        if dcol and grade_col:
+            with engine.begin() as conn:
+                grads = conn.execute(text(f"""
+                    SELECT DISTINCT ON (student_id)
+                           student_id, {grade_col} AS g, {dcol} AS d
+                    FROM {T_GRADUATION}
+                    ORDER BY student_id, {dcol} DESC, id DESC
+                """)).mappings().all()
+            gmap = {r["student_id"]: (r["g"], r["d"]) for r in grads}
+            df["Graduação"] = df["id"].map(lambda i: gmap.get(i, ("Branca", None))[0])
+            df["Data Graduação"] = df["id"].map(lambda i: fmt_date(gmap.get(i, (None, None))[1]))
+        else:
+            df["Graduação"] = "Branca"; df["Data Graduação"] = "—"
     else:
         df["Graduação"] = "Branca"; df["Data Graduação"] = "—"
     return df
@@ -276,8 +283,12 @@ def fetch_grads_df(student_id: Optional[int]=None) -> pd.DataFrame:
     stmt = select(tbl)
     if student_id is not None and has_col(tbl, "student_id"):
         stmt = stmt.where(tbl.c.student_id == student_id)
+    # order por coluna de data disponível
+    order_col = None
+    for c in ["date","grade_date","created_at"]:
+        if has_col(tbl, c): order_col = tbl.c[c]; break
     with engine.begin() as conn:
-        rows = conn.execute(stmt.order_by(tbl.c.get("date", list(tbl.c.values())[0]))).mappings().all()
+        rows = conn.execute(stmt.order_by(order_col if order_col is not None else list(tbl.c.values())[0])).mappings().all()
     return pd.DataFrame(rows)
 
 @st.cache_data(ttl=30)
@@ -288,7 +299,8 @@ def fetch_payments_df(month: Optional[str]=None) -> pd.DataFrame:
     if month and has_col(tbl, "month_ref"):
         stmt = stmt.where(tbl.c.month_ref == month)
     with engine.begin() as conn:
-        rows = conn.execute(stmt.order_by(tbl.c.get("paid_date", list(tbl.c.values())[0]).desc())).mappings().all()
+        order_col = tbl.c.get("paid_date", list(tbl.c.values())[0])
+        rows = conn.execute(stmt.order_by(order_col.desc())).mappings().all()
     return pd.DataFrame(rows)
 
 @st.cache_data(ttl=30)
@@ -299,8 +311,32 @@ def fetch_extras_df(month: Optional[str]=None) -> pd.DataFrame:
     if month and has_col(tbl, "month_ref"):
         stmt = stmt.where(or_(tbl.c.month_ref == month, tbl.c.get("is_recurring", text("0")) == True))
     with engine.begin() as conn:
-        rows = conn.execute(stmt.order_by(tbl.c.get("created_at", list(tbl.c.values())[0]).desc())).mappings().all()
+        order_col = tbl.c.get("created_at", list(tbl.c.values())[0])
+        rows = conn.execute(stmt.order_by(order_col.desc())).mappings().all()
     return pd.DataFrame(rows)
+
+# ---------------------------------------------------------
+# UTIL: payload para graduations com nomes flexíveis
+# ---------------------------------------------------------
+def build_grad_payload(student_id: int, grade: str, when: date, notes: Optional[str]) -> Dict[str, Any]:
+    tbl = reflect_table(T_GRADUATION)
+    if tbl is None: return {}
+    payload: Dict[str, Any] = {}
+    # student_id
+    if has_col(tbl, "student_id"): payload["student_id"] = student_id
+    # grade
+    if has_col(tbl, "grade"): payload["grade"] = grade
+    elif has_col(tbl, "graduation"): payload["graduation"] = grade
+    # date
+    if has_col(tbl, "date"): payload["date"] = when
+    elif has_col(tbl, "grade_date"): payload["grade_date"] = when
+    elif has_col(tbl, "created_at"): payload["created_at"] = when
+    # notes
+    if notes:
+        if has_col(tbl, "notes"): payload["notes"] = notes
+        elif has_col(tbl, "obs"): payload["obs"] = notes
+        elif has_col(tbl, "observations"): payload["observations"] = notes
+    return payload
 
 # ---------------------------------------------------------
 # NAV
@@ -310,15 +346,14 @@ PAGES = ["Alunos","Relatórios"] if st.session_state["role"] == "operador" else 
 st.sidebar.markdown("### Navegação")
 page = st.sidebar.radio("Ir para:", PAGES, index=0, label_visibility="collapsed")
 
-st.title("🥊 Gestão da Turma de Muay Thai")
+st.title("🥊 JAT - Gestão de alunos")
 
 # ---------------------------------------------------------
 # ALUNOS
 # ---------------------------------------------------------
 if page == "Alunos":
     df_students = fetch_students_df()
-    dfc = get_coaches_df()
-    dfs = get_slots_df()
+    dfc, dfs = get_coaches_df(), get_slots_df()
 
     st.subheader("Lista de alunos")
     if df_students.empty:
@@ -335,31 +370,29 @@ if page == "Alunos":
     st.divider()
     col1, col2 = st.columns([1,1])
 
+    # opções dropdown
+    coach_opts = [(None,"(Sem professor)")]
+    if not dfc.empty and "id" in dfc.columns and "name" in dfc.columns:
+        coach_opts += [(int(i), n) for i,n in zip(dfc["id"], dfc["name"])]
+    slot_opts = [(None,"(Sem horário)")]
+    if not dfs.empty and "id" in dfs.columns:
+        label_col = None
+        for cand in ["name","label","title","slot","descricao","hora","time"]:
+            if cand in dfs.columns: label_col = cand; break
+        if label_col:
+            slot_opts += [(int(i), str(l)) for i,l in zip(dfs["id"], dfs[label_col])]
+        else:
+            slot_opts += [(int(i), f"ID {int(i)}") for i in dfs["id"]]
+
     # CADASTRAR
     with col1:
         st.markdown("### ➕ Cadastrar novo aluno")
-        coach_opts = [(None,"(Sem professor)")]
-        if not dfc.empty and "id" in dfc.columns and "name" in dfc.columns:
-            coach_opts += [(int(i), n) for i,n in zip(dfc["id"], dfc["name"])]
-
-        slot_opts = [(None,"(Sem horário)")]
-        if not dfs.empty and "id" in dfs.columns:
-            # usa 1ª coluna de texto como label
-            label_col = None
-            for cand in ["name","label","title","slot","descricao","hora","time"]:
-                if cand in dfs.columns: label_col = cand; break
-            if label_col:
-                slot_opts += [(int(i), str(l)) for i,l in zip(dfs["id"], dfs[label_col])]
-            else:
-                slot_opts += [(int(i), f"ID {int(i)}") for i in dfs["id"]]
-
         with st.form("form_new_student", clear_on_submit=False):
             n_name  = st.text_input("Nome *")
             n_birth = st.date_input("Data de nascimento", value=date(2000,1,1), min_value=BIRTH_MIN, max_value=BIRTH_MAX, format="DD/MM/YYYY")
             n_start = st.date_input("Início do treino", value=date.today(), min_value=TRAIN_MIN, max_value=TRAIN_MAX, format="DD/MM/YYYY")
             n_fee   = st.number_input("Mensalidade (R$)", min_value=0.0, step=10.0, format="%.2f")
             n_active= st.checkbox("Ativo?", value=True)
-            # override de repasse (%)
             n_override_pct = st.number_input("Repasse do aluno (%) (deixe 0 para usar padrão)", min_value=0, max_value=100, value=0, step=5)
             n_coach = st.selectbox("Professor responsável", [o[0] for o in coach_opts], format_func=lambda v: dict(coach_opts)[v])
             n_slot  = st.selectbox("Horário de treino", [o[0] for o in slot_opts], format_func=lambda v: dict(slot_opts)[v])
@@ -375,15 +408,14 @@ if page == "Alunos":
                 }
                 if n_coach is not None: payload["coach_id"] = int(n_coach)
                 if n_slot  is not None: payload["train_slot_id"] = int(n_slot)
-                # override em decimal (0..1)
-                if n_override_pct > 0:
-                    payload["master_percent_override"] = float(n_override_pct) / 100.0
+                if n_override_pct > 0: payload["master_percent_override"] = float(n_override_pct)/100.0
 
                 new_id = insert_row(T_STUDENT, payload) or 0
-                # graduação branca automática com data do início
-                insert_row(T_GRADUATION, {"student_id": new_id, "grade": "Branca", "date": n_start})
-                st.success(f"Aluno cadastrado (ID {new_id}).")
-                st.rerun()
+                # graduação branca com data do início
+                gp = build_grad_payload(new_id, "Branca", n_start, None)
+                if gp: insert_row(T_GRADUATION, gp)
+
+                st.success(f"Aluno cadastrado (ID {new_id})."); st.rerun()
             except Exception as e:
                 st.error(f"Erro: {e}")
 
@@ -404,16 +436,27 @@ if page == "Alunos":
                         e_birth = st.date_input("Data de nascimento", value=parse_date(row.get("birth_date")) or date(2000,1,1), min_value=BIRTH_MIN, max_value=BIRTH_MAX, format="DD/MM/YYYY")
                         e_start = st.date_input("Início do treino", value=parse_date(row.get("start_date")) or date.today(), min_value=TRAIN_MIN, max_value=TRAIN_MAX, format="DD/MM/YYYY")
                         e_active= st.checkbox("Ativo?", value=bool(row.get("active",True)))
-                        # leitura da graduação atual
+                        # leitura da graduação atual (somente leitura)
                         st.text_input("Graduação atual", value=str(row.get("Graduação","Branca")), disabled=True)
                     with c2:
-                        e_fee   = st.number_input("Mensalidade (R$)", value=float(row.get("monthly_fee",0.0) or 0.0), min_value=0.0, step=10.0, format="%.2f")
-                        # override %
-                        cur_override = float(row.get("master_percent_override") or 0.0) * 100.0
-                        e_override = st.number_input("Repasse do aluno (%) (0 = usar padrão)", min_value=0, max_value=100, value=int(round(cur_override)), step=5)
-                        # professores/horários
-                        e_coach = st.selectbox("Professor responsável", [o[0] for o in coach_opts], index=( [o[0] for o in coach_opts].index(row.get("coach_id")) if row.get("coach_id") in [o[0] for o in coach_opts] else 0 ), format_func=lambda v: dict(coach_opts)[v])
-                        e_slot  = st.selectbox("Horário de treino", [o[0] for o in slot_opts], index=( [o[0] for o in slot_opts].index(row.get("train_slot_id")) if row.get("train_slot_id") in [o[0] for o in slot_opts] else 0 ), format_func=lambda v: dict(slot_opts)[v])
+                        e_fee = st.number_input("Mensalidade (R$)", value=float(row.get("monthly_fee",0.0) or 0.0), min_value=0.0, step=10.0, format="%.2f")
+
+                        val_override = row.get("master_percent_override")
+                        if val_override is None or (isinstance(val_override, float) and math.isnan(val_override)):
+                            cur_override_pct = 0
+                        else:
+                            try: cur_override_pct = int(round(float(val_override) * 100.0))
+                            except Exception: cur_override_pct = 0
+                        e_override = st.number_input("Repasse do aluno (%) (0 = usar padrão)", min_value=0, max_value=100, value=cur_override_pct, step=5)
+
+                        # professores/horários (dropdown dos mestres)
+                        coach_ids = [o[0] for o in coach_opts]
+                        slot_ids  = [o[0] for o in slot_opts]
+                        def idx(lst, val): 
+                            try: return lst.index(val)
+                            except ValueError: return 0
+                        e_coach = st.selectbox("Professor responsável", coach_ids, index=idx(coach_ids, row.get("coach_id")), format_func=lambda v: dict(coach_opts)[v])
+                        e_slot  = st.selectbox("Horário de treino",   slot_ids,  index=idx(slot_ids,  row.get("train_slot_id")), format_func=lambda v: dict(slot_opts)[v])
 
                     b_save = st.form_submit_button("Atualizar", type="primary")
                     b_del  = st.form_submit_button("Excluir", type="secondary")
@@ -429,11 +472,9 @@ if page == "Alunos":
                         }
                         if e_coach is not None: pay["coach_id"] = int(e_coach)
                         if e_slot  is not None: pay["train_slot_id"] = int(e_slot)
-                        if e_override > 0: pay["master_percent_override"] = float(e_override)/100.0
-                        else:              pay["master_percent_override"] = None
+                        pay["master_percent_override"] = (float(e_override)/100.0) if e_override > 0 else None
                         n = update_row(T_STUDENT, int(sid), pay)
-                        st.success("Atualizado." if n else "Nada para fazer.")
-                        st.rerun()
+                        st.success("Atualizado." if n else "Nada para fazer."); st.rerun()
                     except Exception as e:
                         st.error(f"Erro: {e}")
 
@@ -441,8 +482,7 @@ if page == "Alunos":
                     require_admin()
                     try:
                         n = delete_rows(T_STUDENT, [int(sid)])
-                        st.success("Excluído." if n else "Não encontrado.")
-                        st.rerun()
+                        st.success("Excluído." if n else "Não encontrado."); st.rerun()
                     except Exception as e:
                         st.error(f"Erro: {e}")
 
@@ -462,9 +502,19 @@ elif page == "Graduações":
             gdf = fetch_grads_df(sid)
             if not gdf.empty:
                 gdf2 = gdf.copy()
-                if "date" in gdf2.columns: gdf2["date"] = gdf2["date"].apply(fmt_date)
-                show = [c for c in ["id","grade","date","notes"] if c in gdf2.columns]
-                st.dataframe(gdf2[show].rename(columns={"grade":"Graduação","date":"Data","notes":"Observações","id":"ID"}), use_container_width=True, hide_index=True)
+                # normaliza nomes para exibir
+                dcol = "date" if "date" in gdf2.columns else ("grade_date" if "grade_date" in gdf2.columns else ("created_at" if "created_at" in gdf2.columns else None))
+                gcol = "grade" if "grade" in gdf2.columns else ("graduation" if "graduation" in gdf2.columns else None)
+                if dcol: gdf2[dcol] = gdf2[dcol].apply(fmt_date)
+                show = [c for c in ["id", gcol, dcol, "notes","obs","observations"] if c and c in gdf2.columns]
+                ren = {}
+                if gcol: ren[gcol] = "Graduação"
+                if dcol: ren[dcol] = "Data"
+                if "notes" in show: ren["notes"]="Observações"
+                if "obs" in show: ren["obs"]="Observações"
+                if "observations" in show: ren["observations"]="Observações"
+                if "id" in show: ren["id"]="ID"
+                st.dataframe(gdf2[show].rename(columns=ren), use_container_width=True, hide_index=True)
             else:
                 st.info("Sem lançamentos.")
 
@@ -477,20 +527,23 @@ elif page == "Graduações":
                 ok = st.form_submit_button("Adicionar", type="primary")
             if ok:
                 try:
-                    insert_row(T_GRADUATION, {"student_id": int(sid), "grade": gg, "date": gd, "notes": (gn or None)})
-                    st.success("Graduação registrada.")
-                    st.rerun()
+                    payload = build_grad_payload(int(sid), gg, gd, (gn or None))
+                    if not payload:
+                        st.error("Tabela de graduações não possui colunas compatíveis.")
+                    else:
+                        insert_row(T_GRADUATION, payload)
+                        st.success("Graduação registrada."); st.rerun()
                 except Exception as e:
                     st.error(f"Erro: {e}")
 
+            # EXCLUSÃO
             if not gdf.empty and "id" in gdf.columns:
                 st.markdown("#### Excluir graduação")
                 gid = st.selectbox("Selecione uma entrada", gdf["id"].tolist())
                 if st.button("🗑️ Excluir graduação selecionada", type="secondary"):
                     try:
                         delete_rows(T_GRADUATION, [int(gid)])
-                        st.success("Excluída.")
-                        st.rerun()
+                        st.success("Excluída."); st.rerun()
                     except Exception as e:
                         st.error(f"Erro: {e}")
 
@@ -531,7 +584,8 @@ elif page == "Receber Pagamento":
         if ok:
             try:
                 tbl_p = reflect_table(T_PAYMENT)
-                if tbl_p is None: st.error("Tabela de pagamentos não encontrada.")
+                if tbl_p is None:
+                    st.error("Tabela de pagamentos não encontrada.")
                 else:
                     okc = 0
                     for sid in pick:
@@ -546,12 +600,13 @@ elif page == "Receber Pagamento":
                             "method": method,
                             "notes": (notes or None)
                         }
+                        # colunas opcionais
                         if has_col(tbl_p, "month_ref") and mref: payload["month_ref"] = mref
                         if has_col(tbl_p, "master_percent_used"): payload["master_percent_used"] = pct_used
+                        if has_col(tbl_p, "master_adjustment"):    payload["master_adjustment"] = 0.0  # evitar NOT NULL
                         insert_row(T_PAYMENT, payload)
                         okc += 1
-                    st.success(f"{okc} pagamento(s) registrado(s).")
-                    st.rerun()
+                    st.success(f"{okc} pagamento(s) registrado(s)."); st.rerun()
             except Exception as e:
                 st.error(f"Erro: {e}")
 
@@ -562,8 +617,8 @@ elif page == "Receber Pagamento":
         if not dpp.empty:
             m = dpp.merge(df_students[["id","name"]], left_on="student_id", right_on="id", how="left", suffixes=("","_stu"))
             m["name"] = m["name"].fillna("(Aluno removido)")
-            view_cols = [c for c in ["id","paid_date","name","amount","master_amount","method","notes"] if c in m.columns]
             if "paid_date" in m.columns: m["paid_date"] = m["paid_date"].apply(fmt_date)
+            view_cols = [c for c in ["id","paid_date","name","amount","master_amount","method","notes"] if c in m.columns]
             m.rename(columns={"id":"ID","name":"Aluno","paid_date":"Data","amount":"Valor (R$)","master_amount":"Repasse (R$)"}, inplace=True)
             st.dataframe(m[view_cols], use_container_width=True, hide_index=True)
 
@@ -580,17 +635,15 @@ elif page == "Receber Pagamento":
                 with c2:
                     if st.button("🧹 Excluir TODOS deste mês", type="secondary", use_container_width=True):
                         try:
-                            tbl = reflect_table(T_PAYMENT)
-                            if tbl is None: st.error("Tabela não encontrada.")
+                            if has_col(tbl_p, "month_ref") and month_list:
+                                stmt = delete(tbl_p).where(tbl_p.c.month_ref == month_list)
                             else:
-                                if has_col(tbl, "month_ref") and month_list:
-                                    stmt = delete(tbl).where(tbl.c.month_ref == month_list)
-                                else:
-                                    stmt = delete(tbl).where(text("strftime('%Y-%m', paid_date) = :m")).params(m=month_list)
-                                with engine.begin() as conn:
-                                    res = conn.execute(stmt)
-                                clear_data_cache()
-                                st.success(f"{res.rowcount or 0} registro(s) removido(s)."); st.rerun()
+                                # SQLite fallback (não usado no Postgres)
+                                stmt = delete(tbl_p).where(text("strftime('%Y-%m', paid_date) = :m")).params(m=month_list)
+                            with engine.begin() as conn:
+                                res = conn.execute(stmt)
+                            clear_data_cache()
+                            st.success(f"{res.rowcount or 0} registro(s) removido(s)."); st.rerun()
                         except Exception as e:
                             st.error(f"Erro: {e}")
         else:
@@ -684,7 +737,7 @@ elif page == "Relatórios":
         st.dataframe(pag, use_container_width=True, hide_index=True)
 
     total_pag = float(pag["Valor (R$)"].sum() if "Valor (R$)" in pag.columns else 0.0)
-    total_rep_pag = float(pag["Repasse (R$)"].sum() if "Repasse (R$)" in pag.columns else 0.0)
+    total_ext = 0.0
 
     st.markdown("### ➕ Relatório de extras (detalhado)")
     if dfe.empty:
@@ -699,8 +752,7 @@ elif page == "Relatórios":
         cols = [c for c in ["id","created_at","Aluno","description","amount","is_recurring"] if c in ext.columns]
         ext = ext[cols].rename(columns={"id":"ID","created_at":"Data","description":"Descrição","amount":"Valor (R$)","is_recurring":"Recorrente?"})
         st.dataframe(ext, use_container_width=True, hide_index=True)
-
-    total_ext = float(ext["Valor (R$)"].sum() if "Valor (R$)" in ext.columns else 0.0)
+        if "Valor (R$)" in ext.columns: total_ext = float(ext["Valor (R$)"].sum())
 
     st.divider()
     c1, c2, c3 = st.columns(3)
@@ -768,6 +820,7 @@ elif page == "Configurações":
     require_admin()
     st.subheader("Configurações")
 
+    # Settings
     tbl = reflect_table(T_SETTINGS)
     if tbl is None:
         st.info("Tabela de configurações não encontrada.")
@@ -788,6 +841,7 @@ elif page == "Configurações":
                 st.error(f"Erro: {e}")
 
     st.divider()
+    # Professores
     st.markdown("#### Professores")
     dfc = get_coaches_df()
     if dfc.empty:
