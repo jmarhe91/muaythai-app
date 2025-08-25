@@ -53,7 +53,7 @@ def require_login() -> str:
             perfil = st.selectbox("Perfil", ["operador", "admin"])
         with col2:
             pwd = st.text_input("Senha", type="password")
-        ok = st.form_submit_button("Entrar")
+        ok = st.form_submit_button("🔐 Entrar")
         if ok:
             if perfil == "admin" and pwd == ADMIN_PWD:
                 st.session_state["role"] = "admin"
@@ -263,11 +263,18 @@ def fetch_students_df() -> pd.DataFrame:
             df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[c.name for c in student.c])
         return df
 
+@st.cache_data(show_spinner=False)
+def get_paid_ids_for_month(month_ref: str) -> Set[int]:
+    with engine.begin() as conn:
+        rows = conn.execute(select(payment.c.student_id).where(payment.c.month_ref==month_ref)).all()
+    return {int(r[0]) for r in rows}
+
 def invalidate_all_cache():
     fetch_settings.clear()
     fetch_coaches.clear()
     fetch_slots.clear()
     fetch_students_df.clear()
+    get_paid_ids_for_month.clear()
 
 def compute_master_percent_for_student(conn: Connection, stu_row: Dict[str, Any]) -> float:
     percent = None
@@ -283,26 +290,39 @@ def compute_master_percent_for_student(conn: Connection, stu_row: Dict[str, Any]
         percent = float(cfg["master_percent"]) if cfg and cfg.get("master_percent") is not None else 0.6
     return percent
 
-# --- NOVO: quem já pagou no mês (para ícones e bloqueio) ---
-@st.cache_data(show_spinner=False)
-def get_paid_ids_for_month(month_ref: str) -> Set[int]:
-    with engine.begin() as conn:
-        rows = conn.execute(select(payment.c.student_id).where(payment.c.month_ref==month_ref)).all()
-    return {int(r[0]) for r in rows}
-
 # ============================================================
 # Páginas
 # ============================================================
 def page_alunos(role: str):
     st.header("Alunos")
+
+    # Mês para o status de pagamento (garante consistência com relatórios/recebimento)
+    month_for_status = st.text_input("Mês p/ status (AAAA-MM)", value=this_month_ref())
+
     df = fetch_students_df()
     if df.empty:
         st.info("Nenhum aluno cadastrado.")
-        # expander de cadastro mesmo sem alunos:
-        pass
+    else:
+        paid_ids = get_paid_ids_for_month(month_for_status)
+
+        view = df.copy()
+        view["Mensalidade"] = view["monthly_fee"].apply(fmt_money)
+        view["Ativo"] = view["active"].map({True: "Sim", False: "Não"})
+        view["Repasse % (aluno)"] = view["master_percent_override"].apply(
+            lambda v: f"{fmt_pct_decimal_to_ui(float(v))*1}%" if v is not None else "-"
+        )
+        view["Nasc."] = pd.to_datetime(view["birth_date"]).dt.strftime("%d/%m/%Y").fillna("")
+        view["Início"] = pd.to_datetime(view["start_date"]).dt.strftime("%d/%m/%Y").fillna("")
+        view["Graduação"] = view["grade"].fillna("-")
+        view["Data grad."] = pd.to_datetime(view["grade_date"]).dt.strftime("%d/%m/%Y").fillna("")
+        view["Status"] = view["id"].apply(lambda i: "🟢 Pago" if int(i) in paid_ids else "🔴 Pendente")
+
+        cols = ["name","Status","Nasc.","Início","Mensalidade","Ativo","Graduação","Data grad.","Repasse % (aluno)"]
+        st.dataframe(view[cols].rename(columns={"name":"Nome"}),
+                     use_container_width=True, hide_index=True)
 
     # ---- Cadastro de novo aluno ----
-    with st.expander("Cadastrar novo aluno", expanded=False):
+    with st.expander("➕ Cadastrar novo aluno", expanded=False):
         with st.form("form_new_student"):
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -324,10 +344,12 @@ def page_alunos(role: str):
                 opt_slot = ["(nenhum)"] + [s["name"] for s in slots]
                 n_coach_name = st.selectbox("Professor responsável", opt_coach)
                 n_slot_name = st.selectbox("Horário de treino", opt_slot)
-                n_override_pct = st.number_input("Repasse do aluno (%) (0 = usar padrão)", min_value=0, max_value=100, value=0, step=5)
+                n_override_pct = st.number_input(
+                    "Repasse do aluno (%) (0 = usar padrão)", min_value=0, max_value=100, value=0, step=5
+                )
                 n_active = st.checkbox("Ativo?", value=True)
 
-            sub = st.form_submit_button("Salvar aluno")
+            sub = st.form_submit_button("💾 Salvar aluno")
 
         if sub:
             if not n_name.strip():
@@ -360,43 +382,21 @@ def page_alunos(role: str):
                         conn.execute(update(student).where(student.c.id == stu_id).values(grade="Branca", grade_date=(n_start or TODAY)))
 
                     invalidate_all_cache()
-                    st.success("Aluno cadastrado com sucesso.")
+                    st.success("✅ Aluno cadastrado com sucesso.")
                     st.rerun()
                 except SQLAlchemyError as e:
                     st.error(f"Erro ao salvar: {e}")
 
-    # ---- Lista de alunos com ícone de status (pago/pendente) ----
-    st.subheader("Lista de alunos")
-
-    month_now = this_month_ref()
-    paid_ids = get_paid_ids_for_month(month_now)
-
-    if not df.empty:
-        view = df.copy()
-        view["Mensalidade"] = view["monthly_fee"].apply(fmt_money)
-        view["Ativo"] = view["active"].map({True: "Sim", False: "Não"})
-        view["Repasse % (aluno)"] = view["master_percent_override"].apply(lambda v: f"{fmt_pct_decimal_to_ui(float(v))*1}%" if v is not None else "-")
-        view["Nasc."] = pd.to_datetime(view["birth_date"]).dt.strftime("%d/%m/%Y").fillna("")
-        view["Início"] = pd.to_datetime(view["start_date"]).dt.strftime("%d/%m/%Y").fillna("")
-        view["Graduação"] = view["grade"].fillna("-")
-        view["Data grad."] = pd.to_datetime(view["grade_date"]).dt.strftime("%d/%m/%Y").fillna("")
-        # Ícone de status:
-        view["Status"] = view["id"].apply(lambda i: "🟢 Pago" if int(i) in paid_ids else "🔴 Pendente")
-
-        cols = ["id","name","Status","Nasc.","Início","Mensalidade","Ativo","Graduação","Data grad.","Repasse % (aluno)"]
-        st.dataframe(view[cols].rename(columns={"id":"ID","name":"Nome"}), use_container_width=True, hide_index=True)
-    else:
-        st.info("Sem alunos para listar.")
-
     # ---- Edição ----
-    with st.expander("Editar aluno", expanded=False):
+    with st.expander("✏️ Editar aluno", expanded=False):
+        df = fetch_students_df()
         if df.empty:
             st.info("Sem alunos.")
         else:
             sid = st.selectbox(
                 "Selecionar aluno",
                 options=df["id"].tolist(),
-                format_func=lambda i: f"ID {i} — " + df.loc[df["id"]==i, "name"].values[0],
+                format_func=lambda i: df.loc[df["id"]==i, "name"].values[0],
             )
             row = df.loc[df["id"]==sid].iloc[0].to_dict()
             with st.form("form_edit_student"):
@@ -432,7 +432,7 @@ def page_alunos(role: str):
                     )
                     e_active = st.checkbox("Ativo?", value=bool(row.get("active")))
 
-                ok = st.form_submit_button("Salvar alterações")
+                ok = st.form_submit_button("💾 Salvar alterações")
             if ok:
                 try:
                     with engine.begin() as conn:
@@ -455,10 +455,36 @@ def page_alunos(role: str):
                             master_percent_override=pct_ui_to_decimal(e_override_pct) if e_override_pct else None,
                         ))
                     invalidate_all_cache()
-                    st.success("Dados atualizados.")
+                    st.success("✅ Dados atualizados.")
                     st.rerun()
                 except SQLAlchemyError as e:
                     st.error(f"Erro ao atualizar: {e}")
+
+    # ---- Exclusão ----
+    with st.expander("🗑️ Excluir aluno", expanded=False):
+        df = fetch_students_df()
+        if df.empty:
+            st.info("Sem alunos.")
+        else:
+            sid_del = st.selectbox(
+                "Escolha o aluno",
+                options=df["id"].tolist(),
+                format_func=lambda i: df.loc[df["id"]==i, "name"].values[0],
+            )
+            st.warning("Esta ação é permanente. Pagamentos e graduações vinculadas serão removidos (via regras de FK).")
+            colx, coly = st.columns([1,3])
+            with colx:
+                confirm = st.checkbox("Confirmo a exclusão")
+            with coly:
+                if st.button("🗑️ Excluir aluno (definitivo)", disabled=not confirm):
+                    try:
+                        with engine.begin() as conn:
+                            conn.execute(delete(student).where(student.c.id==sid_del))
+                        invalidate_all_cache()
+                        st.success("Aluno excluído.")
+                        st.rerun()
+                    except SQLAlchemyError as e:
+                        st.error(f"Erro ao excluir: {e}")
 
 def page_graduacoes(role: str):
     st.header("Graduações")
@@ -469,7 +495,7 @@ def page_graduacoes(role: str):
     sid = st.selectbox(
         "Aluno",
         options=df["id"].tolist(),
-        format_func=lambda i: df.loc[df["id"]==i, "name"].values[0] + f" (ID {i})"
+        format_func=lambda i: df.loc[df["id"]==i, "name"].values[0]
     )
     stu = df.loc[df["id"]==sid].iloc[0].to_dict()
 
@@ -480,7 +506,7 @@ def page_graduacoes(role: str):
     if not hist.empty:
         hist["Data"] = pd.to_datetime(hist["grade_date"]).dt.strftime("%d/%m/%Y")
         st.subheader("Histórico")
-        st.dataframe(hist[["id","grade","Data","notes"]].rename(columns={"id":"ID","grade":"Graduação","notes":"Observações"}),
+        st.dataframe(hist[["grade","Data","notes"]].rename(columns={"grade":"Graduação","notes":"Observações"}),
                      use_container_width=True, hide_index=True)
     else:
         st.info("Sem graduações registradas para este aluno.")
@@ -497,7 +523,7 @@ def page_graduacoes(role: str):
                 min_value=min_g, max_value=GRADE_MAX, format="DD/MM/YYYY",
             )
         g_notes = st.text_input("Observações (opcional)")
-        ok = st.form_submit_button("Salvar graduação")
+        ok = st.form_submit_button("💾 Salvar graduação")
     if ok:
         try:
             with engine.begin() as conn:
@@ -514,7 +540,7 @@ def page_graduacoes(role: str):
                                  .where(student.c.id == sid)
                                  .values(grade=last["grade"], grade_date=last["grade_date"]))
             invalidate_all_cache()
-            st.success("Graduação registrada.")
+            st.success("✅ Graduação registrada.")
             st.rerun()
         except SQLAlchemyError as e:
             st.error(f"Erro ao salvar graduação: {e}")
@@ -546,7 +572,7 @@ def page_receber(role: str):
             cid = next((c["id"] for c in coaches if c["name"]==filtro_coach), None)
             df_active = df_active[df_active["coach_id"]==cid]
 
-        # NOVO: filtro de status pago/pendente
+        # Filtro de status pago/pendente
         status_filter = st.radio("Status", ["Pendentes","Pagos","Todos"], horizontal=True, index=0)
 
         paid_ids = get_paid_ids_for_month(month_ref)
@@ -557,23 +583,23 @@ def page_receber(role: str):
         else:
             df_list = df_active.copy()
 
-        # Para evitar duplo pagamento, só disponibilizamos alunos pendentes na seleção:
+        # Seleção só de pendentes (para não pagar 2x)
         selectable_ids = df_list[~df_list["id"].isin(paid_ids)]["id"].tolist()
         sel = st.multiselect(
             "Selecione os alunos que pagaram (somente pendentes aparecem aqui)",
             options=selectable_ids,
-            format_func=lambda i: df_active.loc[df_active["id"]==i, "name"].values[0] + f" (R$ {float(df_active.loc[df_active['id']==i,'monthly_fee'].values[0]):.2f})"
+            format_func=lambda i: df_active.loc[df_active["id"]==i, "name"].values[0] + \
+                                  f" (R$ {float(df_active.loc[df_active['id']==i,'monthly_fee'].values[0]):.2f})"
         )
         method = st.selectbox("Forma", ["Dinheiro","PIX","Cartão","Transferência","Outro"])
         notes = st.text_input("Observações (opcional)")
 
-        ok = st.form_submit_button("Confirmar recebimento")
+        ok = st.form_submit_button("✅ Confirmar recebimento")
 
     if ok:
         if not sel:
             st.warning("Selecione pelo menos um aluno.")
         else:
-            # checagem server-side para garantir 1 pagamento por mês/aluno
             already = []
             inserted = 0
             try:
@@ -599,16 +625,17 @@ def page_receber(role: str):
                         ))
                         inserted += 1
                 if inserted:
-                    st.success(f"{inserted} pagamento(s) registrado(s).")
+                    st.success(f"✅ {inserted} pagamento(s) registrado(s).")
                 if already:
                     nomes = ", ".join(df.loc[df["id"].isin(already), "name"].tolist())
-                    st.warning(f"Já havia pagamento no mês para: {nomes}. Não foram duplicados.")
+                    st.warning(f"⚠️ Já havia pagamento no mês para: {nomes}. Não foram duplicados.")
                 if inserted or already:
+                    invalidate_all_cache()
                     st.rerun()
             except SQLAlchemyError as e:
                 st.error(f"Erro: {e}")
 
-    # Lista do mês (só para visualização / exclusão)
+    # Lista do mês (visualização / exclusão)
     st.subheader("Pagamentos do mês")
     month = st.text_input("Mês (AAAA-MM)", value=this_month_ref(), key="list_pay_month")
     with engine.begin() as conn:
@@ -625,28 +652,30 @@ def page_receber(role: str):
         dfp["Data"] = pd.to_datetime(dfp["paid_date"]).dt.strftime("%d/%m/%Y")
         dfp["Valor (R$)"] = dfp["amount"].apply(fmt_money)
         dfp["Repasse (R$)"] = dfp["master_amount"].apply(fmt_money)
-        show = dfp[["id","aluno","Data","month_ref","Valor (R$)","method","notes","Repasse (R$)"]].rename(
-            columns={"id":"ID","aluno":"Aluno","month_ref":"Ref.","method":"Forma","notes":"Obs."}
+        show = dfp[["aluno","Data","month_ref","Valor (R$)","method","notes","Repasse (R$)"]].rename(
+            columns={"aluno":"Aluno","month_ref":"Ref.","method":"Forma","notes":"Obs."}
         )
         st.dataframe(show, use_container_width=True, hide_index=True)
 
         c1, c2 = st.columns([1,1])
         with c1:
             ids_del = st.multiselect("Excluir pagamentos", options=dfp["id"].tolist(), format_func=lambda i: f"ID {i}")
-            if st.button("Excluir selecionados"):
+            if st.button("🗑️ Excluir selecionados"):
                 try:
                     with engine.begin() as conn:
                         if ids_del:
                             conn.execute(delete(payment).where(payment.c.id.in_(ids_del)))
+                    invalidate_all_cache()
                     st.success("Excluído(s).")
                     st.rerun()
                 except SQLAlchemyError as e:
                     st.error(f"Erro ao excluir: {e}")
         with c2:
-            if st.button('Excluir TODOS deste mês'):
+            if st.button('🧹 Excluir TODOS deste mês'):
                 try:
                     with engine.begin() as conn:
                         conn.execute(delete(payment).where(payment.c.month_ref==month))
+                    invalidate_all_cache()
                     st.success("Pagamentos do mês excluídos.")
                     st.rerun()
                 except SQLAlchemyError as e:
@@ -672,20 +701,20 @@ def page_extras(role: str):
             is_rec = st.checkbox("Recorrente mês a mês?", value=False)
         with col6:
             df = fetch_students_df()
-            opt = ["(sem aluno vinculado)"] + [f"ID {int(i)} — {n}" for i,n in zip(df["id"], df["name"])]
+            opt = ["(sem aluno vinculado)"] + [f"{n} (ID {int(i)})" for i,n in zip(df["id"], df["name"])]
             pick = st.selectbox("Vincular a um aluno (opcional)", opt)
-        ok = st.form_submit_button("Adicionar extra")
+        ok = st.form_submit_button("➕ Adicionar extra")
     if ok:
         try:
             with engine.begin() as conn:
                 sid = None
                 if pick != "(sem aluno vinculado)":
-                    sid = int(pick.split(" ")[1])
+                    sid = int(pick.split("ID")[-1].strip(" )"))
                 conn.execute(insert(extra_repasse).values(
                     date=dt, month_ref=month_ref, description=desc.strip(),
                     amount=float(val), is_recurring=bool(is_rec), student_id=sid
                 ))
-            st.success("Extra adicionado.")
+            st.success("✅ Extra adicionado.")
             st.rerun()
         except SQLAlchemyError as e:
             st.error(f"Erro ao salvar: {e}")
@@ -701,12 +730,12 @@ def page_extras(role: str):
     else:
         dfe["Data"] = pd.to_datetime(dfe["date"]).dt.strftime("%d/%m/%Y")
         dfe["Valor (R$)"] = dfe["amount"].apply(fmt_money)
-        st.dataframe(dfe[["id","Data","month_ref","description","Valor (R$)","is_recurring","student_id"]]
-                     .rename(columns={"id":"ID","month_ref":"Ref.","description":"Descrição","is_recurring":"Recorrente?","student_id":"Aluno ID"}),
+        st.dataframe(dfe[["Data","month_ref","description","Valor (R$)","is_recurring","student_id"]]
+                     .rename(columns={"month_ref":"Ref.","description":"Descrição","is_recurring":"Recorrente?","student_id":"Aluno ID"}),
                      use_container_width=True, hide_index=True)
 
         ids_del = st.multiselect("Excluir extras", options=dfe["id"].tolist(), format_func=lambda i: f"ID {i}")
-        if st.button("Excluir selecionados"):
+        if st.button("🗑️ Excluir selecionados"):
             try:
                 with engine.begin() as conn:
                     if ids_del:
@@ -799,14 +828,14 @@ def page_config(role: str):
     with st.form("form_cfg"):
         pct_ui = st.number_input("Percentual padrão de repasse (%)", min_value=0, max_value=100,
                                  value=fmt_pct_decimal_to_ui(cfg.get("master_percent")), step=5)
-        ok = st.form_submit_button("Salvar configuração")
+        ok = st.form_submit_button("💾 Salvar configuração")
     if ok:
         try:
             with engine.begin() as conn:
                 conn.execute(update(settings).where(settings.c.id==1)
                              .values(master_percent=pct_ui_to_decimal(pct_ui)))
             invalidate_all_cache()
-            st.success("Configuração atualizada.")
+            st.success("✅ Configuração atualizada.")
         except SQLAlchemyError as e:
             st.error(f"Erro ao salvar configurações: {e}")
 
@@ -817,13 +846,13 @@ def page_config(role: str):
             c_name = st.text_input("Nome do professor")
         with col2:
             c_full = st.checkbox("Repasse 100% (full pass)?", value=False)
-        ok1 = st.form_submit_button("Adicionar professor")
+        ok1 = st.form_submit_button("➕ Adicionar professor")
     if ok1 and c_name.strip():
         try:
             with engine.begin() as conn:
                 conn.execute(insert(coach).values(name=c_name.strip(), full_pass=bool(c_full)))
             invalidate_all_cache()
-            st.success("Professor adicionado.")
+            st.success("✅ Professor adicionado.")
             st.rerun()
         except SQLAlchemyError as e:
             st.error(f"Erro: {e}")
@@ -831,26 +860,26 @@ def page_config(role: str):
     dfc = pd.DataFrame(fetch_coaches())
     if not dfc.empty:
         dfc["Full pass?"] = dfc["full_pass"].map({True:"Sim", False:"Não"})
-        st.dataframe(dfc[["id","name","Full pass?"]].rename(columns={"id":"ID","name":"Nome"}),
+        st.dataframe(dfc[["name","Full pass?"]].rename(columns={"name":"Nome"}),
                      use_container_width=True, hide_index=True)
 
     st.subheader("Horários (treinos)")
     with st.form("form_slot"):
         s_name = st.text_input("Descrição do horário (ex.: Seg/Qua 19h)")
-        ok2 = st.form_submit_button("Adicionar horário")
+        ok2 = st.form_submit_button("➕ Adicionar horário")
     if ok2 and s_name.strip():
         try:
             with engine.begin() as conn:
                 conn.execute(insert(train_slot).values(name=s_name.strip()))
             invalidate_all_cache()
-            st.success("Horário adicionado.")
+            st.success("✅ Horário adicionado.")
             st.rerun()
         except SQLAlchemyError as e:
             st.error(f"Erro: {e}")
 
     dfs = pd.DataFrame(fetch_slots())
     if not dfs.empty:
-        st.dataframe(dfs.rename(columns={"id":"ID","name":"Horário"}),
+        st.dataframe(dfs.rename(columns={"name":"Horário"}),
                      use_container_width=True, hide_index=True)
 
 # ============================================================
@@ -866,7 +895,7 @@ def main():
             index=0,
             label_visibility="collapsed"
         )
-        if st.button("Sair"):
+        if st.button("🚪 Sair"):
             st.session_state.clear()
             st.rerun()
 
