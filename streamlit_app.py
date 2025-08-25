@@ -10,20 +10,38 @@ from sqlalchemy import (
     text, or_
 )
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
+from sqlalchemy.exc import NoSuchTableError
 
-# ---------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------
-st.set_page_config(page_title="JAT - Gestão de alunos", page_icon="🥊", layout="wide")
+# =========================================================
+# CONFIG / BRAND
+# =========================================================
+APP_TITLE = "JAT - Gestão de alunos"
 
+HERE = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
+LOGO_PATH = os.path.join(HERE, "logo.png")
+PAGE_ICON = LOGO_PATH if os.path.isfile(LOGO_PATH) else "🥋"
+
+st.set_page_config(page_title=APP_TITLE, page_icon=PAGE_ICON, layout="wide")
+
+# Se existir, mostra o logo no topo
+if os.path.isfile(LOGO_PATH):
+    col_logo, col_title = st.columns([1, 6])
+    with col_logo:
+        st.image(LOGO_PATH, use_container_width=True)
+    with col_title:
+        st.title(APP_TITLE)
+else:
+    st.title(APP_TITLE)
+
+# =========================================================
+# DB / TABLE NAMES
+# =========================================================
 DB_URL = (
     st.secrets.get("DATABASE_URL")
     or os.getenv("DATABASE_URL")
-    or f"sqlite:///{os.path.join(os.path.dirname(__file__), 'muaythai.db')}"
+    or f"sqlite:///{os.path.join(HERE, 'muaythai.db')}"
 )
 
-# nomes (ajuste aqui se forem outros)
 T_STUDENT     = "student"
 T_GRADUATION  = "graduation_history"
 T_PAYMENT     = "payment"
@@ -41,9 +59,9 @@ GRADE_CHOICES = [
     "Vermelha e Branca","Preta"
 ]
 
-# ---------------------------------------------------------
-# DB
-# ---------------------------------------------------------
+# =========================================================
+# ENGINE / REFLECTION
+# =========================================================
 @st.cache_resource(show_spinner=False)
 def get_engine() -> Engine:
     return create_engine(DB_URL, pool_pre_ping=True, future=True)
@@ -60,17 +78,32 @@ def reflect_table(name: str) -> Optional[Table]:
 def has_col(tbl: Optional[Table], col: str) -> bool:
     return (tbl is not None) and (col in tbl.c)
 
-def clear_data_cache():
-    for fn in (
-        fetch_students_df, fetch_grads_df, fetch_payments_df, fetch_extras_df,
-        get_settings, get_coaches_df, get_slots_df
-    ):
-        try: fn.clear()
-        except Exception: pass
+def _dialect() -> str:
+    try:
+        return engine.dialect.name or ""
+    except Exception:
+        return ""
 
-# ---------------------------------------------------------
+# =========================================================
+# FLASH MESSAGES (persistem após rerun)
+# =========================================================
+def flash(kind: str, msg: str):
+    st.session_state.setdefault("_flash", []).append((kind, msg))
+
+def show_flashes():
+    if st.session_state.get("_flash"):
+        for kind, msg in st.session_state["_flash"]:
+            if   kind == "success": st.success(msg)
+            elif kind == "warning": st.warning(msg)
+            elif kind == "error":   st.error(msg)
+            else:                   st.info(msg)
+        st.session_state["_flash"] = []
+
+show_flashes()
+
+# =========================================================
 # HELPERS
-# ---------------------------------------------------------
+# =========================================================
 def fmt_date(d: Optional[date]) -> str:
     if d in (None, "", "None"): return "—"
     if isinstance(d, str):
@@ -111,9 +144,9 @@ def money(v: Any) -> str:
     s = f"{f:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     return f"R$ {s}"
 
-# ---------------------------------------------------------
+# =========================================================
 # LOGIN
-# ---------------------------------------------------------
+# =========================================================
 def _do_login():
     st.sidebar.subheader("🔐 Login")
     u = st.sidebar.text_input("Usuário")
@@ -130,6 +163,7 @@ def _do_login():
         u_in, p_in = (u or "").strip().lower(), (p or "").strip()
         if u_in in users and p_in == users[u_in]["pw"] and p_in != "":
             st.session_state["user"], st.session_state["role"] = u_in, users[u_in]["role"]
+            flash("success", f"Bem-vindo, {u_in}!")
             st.rerun()
         else:
             st.sidebar.error("Usuário ou senha inválidos.")
@@ -140,6 +174,7 @@ with st.sidebar:
     st.caption(f"Usuário: **{st.session_state['user']}** · Perfil: **{st.session_state['role']}**")
     if st.button("Sair", use_container_width=True):
         for k in ("user","role"): st.session_state.pop(k, None)
+        flash("info", "Sessão encerrada.")
         st.rerun()
 
 def require_admin():
@@ -147,9 +182,9 @@ def require_admin():
         st.warning("Somente o administrador pode acessar esta seção.")
         st.stop()
 
-# ---------------------------------------------------------
-# SETTINGS/MASTERS
-# ---------------------------------------------------------
+# =========================================================
+# SETTINGS / DATA LOADERS
+# =========================================================
 @st.cache_data(ttl=30)
 def get_settings() -> Dict[str, Any]:
     tbl = reflect_table(T_SETTINGS)
@@ -177,18 +212,19 @@ def get_slots_df() -> pd.DataFrame:
 def compute_share_and_percent(student_row: Dict[str, Any], amount: float) -> Tuple[float, float]:
     """Retorna (repasse_em_reais, percentual_usado 0..1)."""
     try:
-        # 100% por professor?
+        # 100% para professor com flag
         if "coach_id" in student_row and student_row.get("coach_id") is not None:
             dfc = get_coaches_df()
             if not dfc.empty and "id" in dfc.columns:
                 row = dfc[dfc["id"] == student_row["coach_id"]]
                 if not row.empty and "full_pass" in row.columns and bool(row.iloc[0].get("full_pass", False)):
                     return float(amount), 1.0
-        # Override aluno?
-        if student_row.get("master_percent_override") is not None and not (isinstance(student_row.get("master_percent_override"), float) and math.isnan(student_row.get("master_percent_override"))):
-            p = float(student_row["master_percent_override"])
+        # Override por aluno (decimal 0..1)
+        ov = student_row.get("master_percent_override")
+        if ov is not None and not (isinstance(ov, float) and math.isnan(ov)):
+            p = float(ov)
             return float(amount) * p, p
-        # Settings?
+        # Padrão (settings)
         cfg = get_settings()
         if cfg.get("master_percent") is not None:
             p = float(cfg["master_percent"])
@@ -197,9 +233,17 @@ def compute_share_and_percent(student_row: Dict[str, Any], amount: float) -> Tup
         pass
     return 0.0, 0.0
 
-# ---------------------------------------------------------
-# CRUD BASE
-# ---------------------------------------------------------
+def clear_data_cache():
+    for fn in (
+        fetch_students_df, fetch_grads_df, fetch_payments_df, fetch_extras_df,
+        get_settings, get_coaches_df, get_slots_df
+    ):
+        try: fn.clear()
+        except Exception: pass
+
+# =========================================================
+# CRUD GENÉRICO
+# =========================================================
 def insert_row(tbl_name: str, values: Dict[str, Any]) -> Optional[int]:
     tbl = reflect_table(tbl_name)
     if tbl is None: return None
@@ -234,9 +278,9 @@ def delete_rows(tbl_name: str, ids: List[int]) -> int:
     clear_data_cache()
     return n
 
-# ---------------------------------------------------------
+# =========================================================
 # FETCH DATAFRAMES
-# ---------------------------------------------------------
+# =========================================================
 @st.cache_data(ttl=30)
 def fetch_students_df() -> pd.DataFrame:
     tbl = reflect_table(T_STUDENT)
@@ -255,7 +299,7 @@ def fetch_students_df() -> pd.DataFrame:
     # graduação atual
     gh = reflect_table(T_GRADUATION)
     if gh is not None and "id" in df.columns:
-        # pega última por data
+        # últimas por data
         date_cols = [c for c in ["date","grade_date","created_at"] if has_col(gh, c)]
         dcol = date_cols[0] if date_cols else None
         grade_col = "grade" if has_col(gh,"grade") else ("graduation" if has_col(gh,"graduation") else None)
@@ -283,7 +327,6 @@ def fetch_grads_df(student_id: Optional[int]=None) -> pd.DataFrame:
     stmt = select(tbl)
     if student_id is not None and has_col(tbl, "student_id"):
         stmt = stmt.where(tbl.c.student_id == student_id)
-    # order por coluna de data disponível
     order_col = None
     for c in ["date","grade_date","created_at"]:
         if has_col(tbl, c): order_col = tbl.c[c]; break
@@ -315,14 +358,13 @@ def fetch_extras_df(month: Optional[str]=None) -> pd.DataFrame:
         rows = conn.execute(stmt.order_by(order_col.desc())).mappings().all()
     return pd.DataFrame(rows)
 
-# ---------------------------------------------------------
-# UTIL: payload para graduations com nomes flexíveis
-# ---------------------------------------------------------
+# =========================================================
+# GRAD PAYLOAD FLEXÍVEL
+# =========================================================
 def build_grad_payload(student_id: int, grade: str, when: date, notes: Optional[str]) -> Dict[str, Any]:
     tbl = reflect_table(T_GRADUATION)
     if tbl is None: return {}
     payload: Dict[str, Any] = {}
-    # student_id
     if has_col(tbl, "student_id"): payload["student_id"] = student_id
     # grade
     if has_col(tbl, "grade"): payload["grade"] = grade
@@ -333,29 +375,26 @@ def build_grad_payload(student_id: int, grade: str, when: date, notes: Optional[
     elif has_col(tbl, "created_at"): payload["created_at"] = when
     # notes
     if notes:
-        if has_col(tbl, "notes"): payload["notes"] = notes
-        elif has_col(tbl, "obs"): payload["obs"] = notes
-        elif has_col(tbl, "observations"): payload["observations"] = notes
+        for c in ["notes","obs","observations"]:
+            if has_col(tbl, c): payload[c] = notes; break
     return payload
 
-# ---------------------------------------------------------
+# =========================================================
 # NAV
-# ---------------------------------------------------------
+# =========================================================
 ALL_PAGES = ["Alunos","Graduações","Receber Pagamento","Extras (Repasse)","Relatórios","Importar / Exportar","Configurações"]
 PAGES = ["Alunos","Relatórios"] if st.session_state["role"] == "operador" else ALL_PAGES
 st.sidebar.markdown("### Navegação")
 page = st.sidebar.radio("Ir para:", PAGES, index=0, label_visibility="collapsed")
 
-st.title("🥊 JAT - Gestão de alunos")
-
-# ---------------------------------------------------------
+# =========================================================
 # ALUNOS
-# ---------------------------------------------------------
+# =========================================================
 if page == "Alunos":
     df_students = fetch_students_df()
     dfc, dfs = get_coaches_df(), get_slots_df()
 
-    st.subheader("Lista de alunos")
+    st.subheader("Alunos cadastrados")
     if df_students.empty:
         st.info("Nenhum aluno.")
     else:
@@ -363,9 +402,12 @@ if page == "Alunos":
         for c in ("birth_date","start_date"):
             if c in dfx.columns: dfx[c] = dfx[c].apply(fmt_date)
         show = [c for c in ["id","name","birth_date","start_date","monthly_fee","active","Graduação","Data Graduação","Idade","Tempo de treino"] if c in dfx.columns]
-        st.dataframe(dfx[show].rename(columns={
-            "id":"ID","name":"Nome","birth_date":"Nascimento","start_date":"Início","monthly_fee":"Mensalidade (R$)","active":"Ativo?"
-        }), use_container_width=True, hide_index=True)
+        st.dataframe(
+            dfx[show].rename(columns={
+                "id":"ID","name":"Nome","birth_date":"Nascimento","start_date":"Início","monthly_fee":"Mensalidade (R$)","active":"Ativo?"
+            }),
+            use_container_width=True, hide_index=True
+        )
 
     st.divider()
     col1, col2 = st.columns([1,1])
@@ -376,9 +418,7 @@ if page == "Alunos":
         coach_opts += [(int(i), n) for i,n in zip(dfc["id"], dfc["name"])]
     slot_opts = [(None,"(Sem horário)")]
     if not dfs.empty and "id" in dfs.columns:
-        label_col = None
-        for cand in ["name","label","title","slot","descricao","hora","time"]:
-            if cand in dfs.columns: label_col = cand; break
+        label_col = next((c for c in ["name","label","title","slot","descricao","hora","time"] if c in dfs.columns), None)
         if label_col:
             slot_opts += [(int(i), str(l)) for i,l in zip(dfs["id"], dfs[label_col])]
         else:
@@ -411,13 +451,13 @@ if page == "Alunos":
                 if n_override_pct > 0: payload["master_percent_override"] = float(n_override_pct)/100.0
 
                 new_id = insert_row(T_STUDENT, payload) or 0
-                # graduação branca com data do início
                 gp = build_grad_payload(new_id, "Branca", n_start, None)
                 if gp: insert_row(T_GRADUATION, gp)
 
-                st.success(f"Aluno cadastrado (ID {new_id})."); st.rerun()
+                flash("success", f"Aluno cadastrado (ID {new_id}).")
+                st.rerun()
             except Exception as e:
-                st.error(f"Erro: {e}")
+                st.error(f"Erro ao cadastrar: {e}")
 
     # EDITAR
     with col2:
@@ -436,7 +476,6 @@ if page == "Alunos":
                         e_birth = st.date_input("Data de nascimento", value=parse_date(row.get("birth_date")) or date(2000,1,1), min_value=BIRTH_MIN, max_value=BIRTH_MAX, format="DD/MM/YYYY")
                         e_start = st.date_input("Início do treino", value=parse_date(row.get("start_date")) or date.today(), min_value=TRAIN_MIN, max_value=TRAIN_MAX, format="DD/MM/YYYY")
                         e_active= st.checkbox("Ativo?", value=bool(row.get("active",True)))
-                        # leitura da graduação atual (somente leitura)
                         st.text_input("Graduação atual", value=str(row.get("Graduação","Branca")), disabled=True)
                     with c2:
                         e_fee = st.number_input("Mensalidade (R$)", value=float(row.get("monthly_fee",0.0) or 0.0), min_value=0.0, step=10.0, format="%.2f")
@@ -449,7 +488,6 @@ if page == "Alunos":
                             except Exception: cur_override_pct = 0
                         e_override = st.number_input("Repasse do aluno (%) (0 = usar padrão)", min_value=0, max_value=100, value=cur_override_pct, step=5)
 
-                        # professores/horários (dropdown dos mestres)
                         coach_ids = [o[0] for o in coach_opts]
                         slot_ids  = [o[0] for o in slot_opts]
                         def idx(lst, val): 
@@ -474,21 +512,22 @@ if page == "Alunos":
                         if e_slot  is not None: pay["train_slot_id"] = int(e_slot)
                         pay["master_percent_override"] = (float(e_override)/100.0) if e_override > 0 else None
                         n = update_row(T_STUDENT, int(sid), pay)
-                        st.success("Atualizado." if n else "Nada para fazer."); st.rerun()
+                        flash("success" if n else "info", "Aluno atualizado." if n else "Nada para atualizar.")
+                        st.rerun()
                     except Exception as e:
-                        st.error(f"Erro: {e}")
+                        st.error(f"Erro ao atualizar: {e}")
 
                 if b_del:
-                    require_admin()
                     try:
                         n = delete_rows(T_STUDENT, [int(sid)])
-                        st.success("Excluído." if n else "Não encontrado."); st.rerun()
+                        flash("success" if n else "warning", "Aluno excluído." if n else "Aluno não encontrado.")
+                        st.rerun()
                     except Exception as e:
-                        st.error(f"Erro: {e}")
+                        st.error(f"Erro ao excluir: {e}")
 
-# ---------------------------------------------------------
+# =========================================================
 # GRADUAÇÕES
-# ---------------------------------------------------------
+# =========================================================
 elif page == "Graduações":
     require_admin()
     st.subheader("Histórico de Graduações")
@@ -502,7 +541,6 @@ elif page == "Graduações":
             gdf = fetch_grads_df(sid)
             if not gdf.empty:
                 gdf2 = gdf.copy()
-                # normaliza nomes para exibir
                 dcol = "date" if "date" in gdf2.columns else ("grade_date" if "grade_date" in gdf2.columns else ("created_at" if "created_at" in gdf2.columns else None))
                 gcol = "grade" if "grade" in gdf2.columns else ("graduation" if "graduation" in gdf2.columns else None)
                 if dcol: gdf2[dcol] = gdf2[dcol].apply(fmt_date)
@@ -531,25 +569,29 @@ elif page == "Graduações":
                     if not payload:
                         st.error("Tabela de graduações não possui colunas compatíveis.")
                     else:
-                        insert_row(T_GRADUATION, payload)
-                        st.success("Graduação registrada."); st.rerun()
+                        nid = insert_row(T_GRADUATION, payload)
+                        if nid:
+                            flash("success", "Graduação registrada.")
+                        else:
+                            flash("warning", "Nada foi inserido (verifique as colunas da tabela).")
+                        st.rerun()
                 except Exception as e:
-                    st.error(f"Erro: {e}")
+                    st.error(f"Erro ao inserir graduação: {e}")
 
-            # EXCLUSÃO
             if not gdf.empty and "id" in gdf.columns:
                 st.markdown("#### Excluir graduação")
                 gid = st.selectbox("Selecione uma entrada", gdf["id"].tolist())
                 if st.button("🗑️ Excluir graduação selecionada", type="secondary"):
                     try:
-                        delete_rows(T_GRADUATION, [int(gid)])
-                        st.success("Excluída."); st.rerun()
+                        n = delete_rows(T_GRADUATION, [int(gid)])
+                        flash("success" if n else "warning", "Graduação excluída." if n else "Não encontrada.")
+                        st.rerun()
                     except Exception as e:
-                        st.error(f"Erro: {e}")
+                        st.error(f"Erro ao excluir: {e}")
 
-# ---------------------------------------------------------
+# =========================================================
 # RECEBER PAGAMENTO
-# ---------------------------------------------------------
+# =========================================================
 elif page == "Receber Pagamento":
     require_admin()
     st.subheader("Receber Pagamentos")
@@ -600,15 +642,15 @@ elif page == "Receber Pagamento":
                             "method": method,
                             "notes": (notes or None)
                         }
-                        # colunas opcionais
                         if has_col(tbl_p, "month_ref") and mref: payload["month_ref"] = mref
                         if has_col(tbl_p, "master_percent_used"): payload["master_percent_used"] = pct_used
-                        if has_col(tbl_p, "master_adjustment"):    payload["master_adjustment"] = 0.0  # evitar NOT NULL
+                        if has_col(tbl_p, "master_adjustment"):    payload["master_adjustment"] = 0.0  # evita NOT NULL
                         insert_row(T_PAYMENT, payload)
                         okc += 1
-                    st.success(f"{okc} pagamento(s) registrado(s)."); st.rerun()
+                    flash("success", f"{okc} pagamento(s) registrado(s).")
+                    st.rerun()
             except Exception as e:
-                st.error(f"Erro: {e}")
+                st.error(f"Erro ao receber pagamento: {e}")
 
         st.divider()
         st.markdown("#### Pagamentos do mês")
@@ -618,40 +660,48 @@ elif page == "Receber Pagamento":
             m = dpp.merge(df_students[["id","name"]], left_on="student_id", right_on="id", how="left", suffixes=("","_stu"))
             m["name"] = m["name"].fillna("(Aluno removido)")
             if "paid_date" in m.columns: m["paid_date"] = m["paid_date"].apply(fmt_date)
-            view_cols = [c for c in ["id","paid_date","name","amount","master_amount","method","notes"] if c in m.columns]
-            m.rename(columns={"id":"ID","name":"Aluno","paid_date":"Data","amount":"Valor (R$)","master_amount":"Repasse (R$)"}, inplace=True)
-            st.dataframe(m[view_cols], use_container_width=True, hide_index=True)
+            display_cols = [c for c in ["id","paid_date","name","amount","master_amount","method","notes"] if c in m.columns]
+            out = m[display_cols].rename(columns={"id":"ID","name":"Aluno","paid_date":"Data","amount":"Valor (R$)","master_amount":"Repasse (R$)"})
+            st.dataframe(out, use_container_width=True, hide_index=True)
 
-            if "ID" in m.columns:
-                del_ids = st.multiselect("Selecionar para excluir", m["ID"].tolist())
+            if "ID" in out.columns:
+                del_ids = st.multiselect("Selecionar para excluir", out["ID"].tolist())
                 c1, c2 = st.columns([1,1])
                 with c1:
                     if st.button("🗑️ Excluir selecionados", type="secondary", use_container_width=True):
                         try:
                             n = delete_rows(T_PAYMENT, [int(i) for i in del_ids])
-                            st.success(f"{n} registro(s) removido(s)."); st.rerun()
+                            flash("success" if n else "info", f"{n} registro(s) removido(s)." if n else "Nada selecionado.")
+                            st.rerun()
                         except Exception as e:
-                            st.error(f"Erro: {e}")
+                            st.error(f"Erro ao excluir: {e}")
                 with c2:
                     if st.button("🧹 Excluir TODOS deste mês", type="secondary", use_container_width=True):
                         try:
-                            if has_col(tbl_p, "month_ref") and month_list:
-                                stmt = delete(tbl_p).where(tbl_p.c.month_ref == month_list)
+                            tbl_p = reflect_table(T_PAYMENT)
+                            if tbl_p is None:
+                                st.error("Tabela não encontrada.")
                             else:
-                                # SQLite fallback (não usado no Postgres)
-                                stmt = delete(tbl_p).where(text("strftime('%Y-%m', paid_date) = :m")).params(m=month_list)
-                            with engine.begin() as conn:
-                                res = conn.execute(stmt)
-                            clear_data_cache()
-                            st.success(f"{res.rowcount or 0} registro(s) removido(s)."); st.rerun()
+                                if has_col(tbl_p, "month_ref") and month_list:
+                                    stmt = delete(tbl_p).where(tbl_p.c.month_ref == month_list)
+                                else:
+                                    if _dialect() == "postgresql":
+                                        stmt = delete(tbl_p).where(text("to_char(paid_date, 'YYYY-MM') = :m")).params(m=month_list)
+                                    else:  # sqlite
+                                        stmt = delete(tbl_p).where(text("strftime('%Y-%m', paid_date) = :m")).params(m=month_list)
+                                with engine.begin() as conn:
+                                    res = conn.execute(stmt)
+                                clear_data_cache()
+                                flash("success", f"{res.rowcount or 0} registro(s) removido(s).")
+                                st.rerun()
                         except Exception as e:
-                            st.error(f"Erro: {e}")
+                            st.error(f"Erro ao excluir em massa: {e}")
         else:
             st.info("Sem pagamentos para o mês.")
 
-# ---------------------------------------------------------
+# =========================================================
 # EXTRAS
-# ---------------------------------------------------------
+# =========================================================
 elif page == "Extras (Repasse)":
     require_admin()
     st.subheader("Lançamentos Extras (positivos/negativos)")
@@ -676,10 +726,12 @@ elif page == "Extras (Repasse)":
             if sid is not None: payload["student_id"] = int(sid)
             tbl = reflect_table(T_EXTRA)
             if has_col(tbl,"is_recurring"): payload["is_recurring"] = bool(rec)
-            insert_row(T_EXTRA, payload)
-            st.success("Extra adicionado!"); st.rerun()
+            nid = insert_row(T_EXTRA, payload)
+            if nid: flash("success", "Extra adicionado!")
+            else:   flash("warning", "Nada foi inserido (verifique as colunas).")
+            st.rerun()
         except Exception as e:
-            st.error(f"Erro: {e}")
+            st.error(f"Erro ao adicionar extra: {e}")
 
     st.divider()
     st.markdown("#### Lista de extras por mês")
@@ -697,19 +749,22 @@ elif page == "Extras (Repasse)":
         if "id" in dfe.columns: view.append("id")
         if "created_at" in dfe.columns: dfe["created_at"] = dfe["created_at"].apply(fmt_date); view.append("created_at")
         view += [c for c in ["Aluno","description","amount","is_recurring"] if c in dfe.columns]
-        st.dataframe(dfe[view].rename(columns={"id":"ID","created_at":"Data","description":"Descrição","amount":"Valor (R$)","is_recurring":"Recorrente?"}), use_container_width=True, hide_index=True)
+        out = dfe[view].rename(columns={"id":"ID","created_at":"Data","description":"Descrição","amount":"Valor (R$)","is_recurring":"Recorrente?"})
+        st.dataframe(out, use_container_width=True, hide_index=True)
 
-        if "id" in dfe.columns:
-            del_ids = st.multiselect("Selecionar extras para excluir", dfe["id"].tolist())
+        if "ID" in out.columns:
+            del_ids = st.multiselect("Selecionar extras para excluir", out["ID"].tolist())
             if st.button("🗑️ Excluir extras selecionados", type="secondary"):
                 try:
-                    n = delete_rows(T_EXTRA, [int(i) for i in del_ids]); st.success(f"{n} removido(s)."); st.rerun()
+                    n = delete_rows(T_EXTRA, [int(i) for i in del_ids])
+                    flash("success" if n else "info", f"{n} removido(s)." if n else "Nada selecionado.")
+                    st.rerun()
                 except Exception as e:
-                    st.error(f"Erro: {e}")
+                    st.error(f"Erro ao excluir: {e}")
 
-# ---------------------------------------------------------
+# =========================================================
 # RELATÓRIOS
-# ---------------------------------------------------------
+# =========================================================
 elif page == "Relatórios":
     st.subheader("Relatório de repasse (mensalidades + extras)")
     month = st.text_input("Mês de referência (AAAA-MM)", value=datetime.today().strftime("%Y-%m"))
@@ -737,7 +792,6 @@ elif page == "Relatórios":
         st.dataframe(pag, use_container_width=True, hide_index=True)
 
     total_pag = float(pag["Valor (R$)"].sum() if "Valor (R$)" in pag.columns else 0.0)
-    total_ext = 0.0
 
     st.markdown("### ➕ Relatório de extras (detalhado)")
     if dfe.empty:
@@ -750,9 +804,13 @@ elif page == "Relatórios":
             ext = dfe.copy(); ext["Aluno"] = "Outros"
         if "created_at" in ext.columns: ext["created_at"] = ext["created_at"].apply(fmt_date)
         cols = [c for c in ["id","created_at","Aluno","description","amount","is_recurring"] if c in ext.columns]
-        ext = ext[cols].rename(columns={"id":"ID","created_at":"Data","description":"Descrição","amount":"Valor (R$)","is_recurring":"Recorrente?"})
+        ext = ext[cols].rename(columns={"id":"ID","created_at":"Data","description":"Descrição","amount":"Valor (R$)","is_recorrente?":"Recorrente?"})
+        # correção do nome da coluna
+        if "Recorrente?" not in ext.columns and "is_recurring" in cols:
+            ext.rename(columns={"is_recurring":"Recorrente?"}, inplace=True)
         st.dataframe(ext, use_container_width=True, hide_index=True)
-        if "Valor (R$)" in ext.columns: total_ext = float(ext["Valor (R$)"].sum())
+
+    total_ext = float(ext["Valor (R$)"].sum() if not ext.empty and "Valor (R$)" in ext.columns else 0.0)
 
     st.divider()
     c1, c2, c3 = st.columns(3)
@@ -768,9 +826,9 @@ elif page == "Relatórios":
         out_csv_ext = ext.to_csv(index=False).encode("utf-8-sig")
         st.download_button("⬇️ Exportar extras", out_csv_ext, file_name=f"extras_{month}.csv", mime="text/csv")
 
-# ---------------------------------------------------------
+# =========================================================
 # IMPORT / EXPORT
-# ---------------------------------------------------------
+# =========================================================
 elif page == "Importar / Exportar":
     require_admin()
     st.subheader("Importar / Exportar")
@@ -809,13 +867,14 @@ elif page == "Importar / Exportar":
                         except: payload["monthly_fee"] = 0.0
                     nid = insert_row(T_STUDENT, payload); 
                     if nid: count += 1
-                st.success(f"{count} aluno(s) importado(s).")
+                flash("success", f"{count} aluno(s) importado(s).")
+                st.rerun()
         except Exception as e:
-            st.error(f"Erro: {e}")
+            st.error(f"Erro ao importar: {e}")
 
-# ---------------------------------------------------------
+# =========================================================
 # CONFIGURAÇÕES
-# ---------------------------------------------------------
+# =========================================================
 elif page == "Configurações":
     require_admin()
     st.subheader("Configurações")
@@ -836,9 +895,10 @@ elif page == "Configurações":
             try:
                 if sid: update_row(T_SETTINGS, int(sid), {"master_percent": float(master_percent)})
                 else:   insert_row(T_SETTINGS, {"master_percent": float(master_percent)})
-                st.success("Configurações salvas."); st.rerun()
+                flash("success", "Configurações salvas.")
+                st.rerun()
             except Exception as e:
-                st.error(f"Erro: {e}")
+                st.error(f"Erro ao salvar configurações: {e}")
 
     st.divider()
     # Professores
@@ -855,7 +915,9 @@ elif page == "Configurações":
             ok = st.form_submit_button("Adicionar professor", type="primary")
         if ok:
             try:
-                insert_row(T_COACH, {"name": nc, "full_pass": bool(fp)})
-                st.success("Professor adicionado."); st.rerun()
+                nid = insert_row(T_COACH, {"name": nc, "full_pass": bool(fp)})
+                if nid: flash("success", "Professor adicionado.")
+                else:   flash("warning", "Nada inserido (verifique colunas).")
+                st.rerun()
             except Exception as e:
-                st.error(f"Erro: {e}")
+                st.error(f"Erro ao adicionar professor: {e}")
