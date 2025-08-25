@@ -1,6 +1,6 @@
 # streamlit_app.py
 # -------------------------------------------------------------
-# JAT - Gestão de alunos (Muay Thai)
+# JAT - Gestão de alunos
 # -------------------------------------------------------------
 # Requisitos:
 #   pip install streamlit sqlalchemy psycopg[binary] pandas python-dateutil
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from datetime import date, datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Set
 
 import pandas as pd
 import streamlit as st
@@ -90,6 +90,9 @@ def clamp_date(d: Optional[date], min_d: date, max_d: date) -> date:
         return max_d
     return d
 
+def this_month_ref(d: date = TODAY) -> str:
+    return d.strftime("%Y-%m")
+
 # ============================================================
 # Banco (Postgres -> SQLite fallback)
 # ============================================================
@@ -103,7 +106,7 @@ engine = get_engine()
 metadata = MetaData()
 
 # ============================================================
-# Esquema
+# Esquema (sem mudanças estruturais)
 # ============================================================
 settings = Table(
     "settings", metadata,
@@ -193,7 +196,6 @@ BELTS = [
 REQUIRED_TABLES = {"settings","coach","train_slot","student","graduation","payment","extra_repasse"}
 
 def bootstrap_db_if_needed() -> None:
-    """Garante que todas as tabelas existam e há linha 1 em settings."""
     try:
         insp = inspect(engine)
         existing = set(insp.get_table_names())
@@ -204,8 +206,6 @@ def bootstrap_db_if_needed() -> None:
             if not row:
                 conn.execute(insert(settings).values(id=1, master_percent=0.60))
     except SQLAlchemyError:
-        # Se algo der errado aqui, deixamos o erro aparecer na primeira query,
-        # mas ao menos tentamos criar as tabelas.
         pass
 
 bootstrap_db_if_needed()
@@ -257,7 +257,6 @@ def fetch_students_df() -> pd.DataFrame:
             df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[c.name for c in student.c])
         return df
     except ProgrammingError:
-        # autocura e tenta de novo
         bootstrap_db_if_needed()
         with engine.begin() as conn:
             rows = conn.execute(select(student).order_by(student.c.name)).mappings().all()
@@ -270,9 +269,6 @@ def invalidate_all_cache():
     fetch_slots.clear()
     fetch_students_df.clear()
 
-# ============================================================
-# Regras de repasse / utilidades
-# ============================================================
 def compute_master_percent_for_student(conn: Connection, stu_row: Dict[str, Any]) -> float:
     percent = None
     cid = stu_row.get("coach_id")
@@ -287,37 +283,25 @@ def compute_master_percent_for_student(conn: Connection, stu_row: Dict[str, Any]
         percent = float(cfg["master_percent"]) if cfg and cfg.get("master_percent") is not None else 0.6
     return percent
 
-def ensure_white_belt_on_create(conn: Connection, stu_id: int, start_dt: Optional[date]):
-    when = start_dt or TODAY
-    conn.execute(insert(graduation).values(student_id=stu_id, grade="Branca", grade_date=when))
-    conn.execute(update(student).where(student.c.id == stu_id).values(grade="Branca", grade_date=when))
-
-def refresh_student_grade(conn: Connection, stu_id: int):
-    last = conn.execute(
-        select(graduation.c.grade, graduation.c.grade_date)
-        .where(graduation.c.student_id == stu_id)
-        .order_by(graduation.c.grade_date.desc(), graduation.c.id.desc())
-        .limit(1)
-    ).mappings().first()
-    if last:
-        conn.execute(update(student)
-                     .where(student.c.id == stu_id)
-                     .values(grade=last["grade"], grade_date=last["grade_date"]))
+# --- NOVO: quem já pagou no mês (para ícones e bloqueio) ---
+@st.cache_data(show_spinner=False)
+def get_paid_ids_for_month(month_ref: str) -> Set[int]:
+    with engine.begin() as conn:
+        rows = conn.execute(select(payment.c.student_id).where(payment.c.month_ref==month_ref)).all()
+    return {int(r[0]) for r in rows}
 
 # ============================================================
-# Páginas (iguais às que você já está usando)
+# Páginas
 # ============================================================
-# ... (A PARTIR DAQUI É IGUAL AO ARQUIVO QUE TE ENVIEI ANTES)
-# Para economizar espaço, não modifiquei nenhuma tela além do bootstrap/acertos acima.
-# ——— Copiei exatamente as funções page_alunos, page_graduacoes, page_receber,
-#     page_extras, page_relatorios e page_config do arquivo anterior. ———
-
-#  ⬇️  Colei novamente sem alterações (mesmo conteúdo do último envio)  ⬇️
-
 def page_alunos(role: str):
     st.header("Alunos")
     df = fetch_students_df()
+    if df.empty:
+        st.info("Nenhum aluno cadastrado.")
+        # expander de cadastro mesmo sem alunos:
+        pass
 
+    # ---- Cadastro de novo aluno ----
     with st.expander("Cadastrar novo aluno", expanded=False):
         with st.form("form_new_student"):
             col1, col2, col3 = st.columns(3)
@@ -344,6 +328,7 @@ def page_alunos(role: str):
                 n_active = st.checkbox("Ativo?", value=True)
 
             sub = st.form_submit_button("Salvar aluno")
+
         if sub:
             if not n_name.strip():
                 st.error("Informe o nome.")
@@ -370,39 +355,48 @@ def page_alunos(role: str):
                             master_percent_override=pct_ui_to_decimal(n_override_pct) if n_override_pct else None,
                         ))
                         stu_id = res.inserted_primary_key[0]
-                        ensure_white_belt_on_create(conn, stu_id, n_start)
+                        # faixa branca automática com data do início
+                        conn.execute(insert(graduation).values(student_id=stu_id, grade="Branca", grade_date=(n_start or TODAY)))
+                        conn.execute(update(student).where(student.c.id == stu_id).values(grade="Branca", grade_date=(n_start or TODAY)))
+
                     invalidate_all_cache()
                     st.success("Aluno cadastrado com sucesso.")
                     st.rerun()
                 except SQLAlchemyError as e:
                     st.error(f"Erro ao salvar: {e}")
 
+    # ---- Lista de alunos com ícone de status (pago/pendente) ----
     st.subheader("Lista de alunos")
-    if df.empty:
-        st.info("Nenhum aluno cadastrado.")
-        return
 
-    view = df.copy()
-    view["Mensalidade"] = view["monthly_fee"].apply(fmt_money)
-    view["Ativo"] = view["active"].map({True: "Sim", False: "Não"})
-    view["Repasse % (aluno)"] = view["master_percent_override"].apply(lambda v: f"{fmt_pct_decimal_to_ui(float(v))*1}%" if v is not None else "-")
-    view["Nasc."] = pd.to_datetime(view["birth_date"]).dt.strftime("%d/%m/%Y").fillna("")
-    view["Início"] = pd.to_datetime(view["start_date"]).dt.strftime("%d/%m/%Y").fillna("")
-    view["Graduação"] = view["grade"].fillna("-")
-    view["Data grad."] = pd.to_datetime(view["grade_date"]).dt.strftime("%d/%m/%Y").fillna("")
+    month_now = this_month_ref()
+    paid_ids = get_paid_ids_for_month(month_now)
 
-    cols = ["id","name","Nasc.","Início","Mensalidade","Ativo","Graduação","Data grad.","Repasse % (aluno)"]
-    st.dataframe(view[cols].rename(columns={"id":"ID","name":"Nome"}), use_container_width=True, hide_index=True)
+    if not df.empty:
+        view = df.copy()
+        view["Mensalidade"] = view["monthly_fee"].apply(fmt_money)
+        view["Ativo"] = view["active"].map({True: "Sim", False: "Não"})
+        view["Repasse % (aluno)"] = view["master_percent_override"].apply(lambda v: f"{fmt_pct_decimal_to_ui(float(v))*1}%" if v is not None else "-")
+        view["Nasc."] = pd.to_datetime(view["birth_date"]).dt.strftime("%d/%m/%Y").fillna("")
+        view["Início"] = pd.to_datetime(view["start_date"]).dt.strftime("%d/%m/%Y").fillna("")
+        view["Graduação"] = view["grade"].fillna("-")
+        view["Data grad."] = pd.to_datetime(view["grade_date"]).dt.strftime("%d/%m/%Y").fillna("")
+        # Ícone de status:
+        view["Status"] = view["id"].apply(lambda i: "🟢 Pago" if int(i) in paid_ids else "🔴 Pendente")
 
+        cols = ["id","name","Status","Nasc.","Início","Mensalidade","Ativo","Graduação","Data grad.","Repasse % (aluno)"]
+        st.dataframe(view[cols].rename(columns={"id":"ID","name":"Nome"}), use_container_width=True, hide_index=True)
+    else:
+        st.info("Sem alunos para listar.")
+
+    # ---- Edição ----
     with st.expander("Editar aluno", expanded=False):
-        df2 = view[["id","name"]].copy()
-        if df2.empty:
+        if df.empty:
             st.info("Sem alunos.")
         else:
             sid = st.selectbox(
                 "Selecionar aluno",
-                options=df2["id"].tolist(),
-                format_func=lambda i: f"ID {i} — " + df2.loc[df2["id"]==i, "name"].values[0],
+                options=df["id"].tolist(),
+                format_func=lambda i: f"ID {i} — " + df.loc[df["id"]==i, "name"].values[0],
             )
             row = df.loc[df["id"]==sid].iloc[0].to_dict()
             with st.form("form_edit_student"):
@@ -508,7 +502,17 @@ def page_graduacoes(role: str):
         try:
             with engine.begin() as conn:
                 conn.execute(insert(graduation).values(student_id=sid, grade=g_grade, grade_date=g_date, notes=g_notes or None))
-                refresh_student_grade(conn, sid)
+                # atualiza grade atual do aluno
+                last = conn.execute(
+                    select(graduation.c.grade, graduation.c.grade_date)
+                    .where(graduation.c.student_id == sid)
+                    .order_by(graduation.c.grade_date.desc(), graduation.c.id.desc())
+                    .limit(1)
+                ).mappings().first()
+                if last:
+                    conn.execute(update(student)
+                                 .where(student.c.id == sid)
+                                 .values(grade=last["grade"], grade_date=last["grade_date"]))
             invalidate_all_cache()
             st.success("Graduação registrada.")
             st.rerun()
@@ -536,29 +540,54 @@ def page_receber(role: str):
                 min_value=PAY_MIN, max_value=PAY_MAX, format="DD/MM/YYYY",
             )
         with col3:
-            month_ref = st.text_input("Mês de referência (AAAA-MM)", value=TODAY.strftime("%Y-%m"))
+            month_ref = st.text_input("Mês de referência (AAAA-MM)", value=this_month_ref())
 
         if filtro_coach != "(todos)":
             cid = next((c["id"] for c in coaches if c["name"]==filtro_coach), None)
             df_active = df_active[df_active["coach_id"]==cid]
 
+        # NOVO: filtro de status pago/pendente
+        status_filter = st.radio("Status", ["Pendentes","Pagos","Todos"], horizontal=True, index=0)
+
+        paid_ids = get_paid_ids_for_month(month_ref)
+        if status_filter == "Pendentes":
+            df_list = df_active[~df_active["id"].isin(paid_ids)].copy()
+        elif status_filter == "Pagos":
+            df_list = df_active[df_active["id"].isin(paid_ids)].copy()
+        else:
+            df_list = df_active.copy()
+
+        # Para evitar duplo pagamento, só disponibilizamos alunos pendentes na seleção:
+        selectable_ids = df_list[~df_list["id"].isin(paid_ids)]["id"].tolist()
         sel = st.multiselect(
-            "Selecione os alunos que pagaram",
-            options=df_active["id"].tolist(),
+            "Selecione os alunos que pagaram (somente pendentes aparecem aqui)",
+            options=selectable_ids,
             format_func=lambda i: df_active.loc[df_active["id"]==i, "name"].values[0] + f" (R$ {float(df_active.loc[df_active['id']==i,'monthly_fee'].values[0]):.2f})"
         )
         method = st.selectbox("Forma", ["Dinheiro","PIX","Cartão","Transferência","Outro"])
         notes = st.text_input("Observações (opcional)")
 
         ok = st.form_submit_button("Confirmar recebimento")
+
     if ok:
         if not sel:
             st.warning("Selecione pelo menos um aluno.")
         else:
+            # checagem server-side para garantir 1 pagamento por mês/aluno
+            already = []
+            inserted = 0
             try:
                 with engine.begin() as conn:
-                    inserted = 0
                     for sid in sel:
+                        exists = conn.execute(
+                            select(payment.c.id).where(
+                                (payment.c.student_id==sid) &
+                                (payment.c.month_ref==month_ref)
+                            )
+                        ).first()
+                        if exists:
+                            already.append(sid)
+                            continue
                         stu_row = df[df["id"]==sid].iloc[0].to_dict()
                         amount = float(stu_row.get("monthly_fee") or 0)
                         percent = compute_master_percent_for_student(conn, stu_row)
@@ -569,12 +598,19 @@ def page_receber(role: str):
                             master_percent_used=percent, master_adjustment=0, master_amount=master_amt
                         ))
                         inserted += 1
-                st.success(f"{inserted} pagamento(s) registrado(s).")
+                if inserted:
+                    st.success(f"{inserted} pagamento(s) registrado(s).")
+                if already:
+                    nomes = ", ".join(df.loc[df["id"].isin(already), "name"].tolist())
+                    st.warning(f"Já havia pagamento no mês para: {nomes}. Não foram duplicados.")
+                if inserted or already:
+                    st.rerun()
             except SQLAlchemyError as e:
                 st.error(f"Erro: {e}")
 
+    # Lista do mês (só para visualização / exclusão)
     st.subheader("Pagamentos do mês")
-    month = st.text_input("Mês (AAAA-MM)", value=TODAY.strftime("%Y-%m"), key="list_pay_month")
+    month = st.text_input("Mês (AAAA-MM)", value=this_month_ref(), key="list_pay_month")
     with engine.begin() as conn:
         q = select(payment, student.c.name.label("aluno")).join(student, student.c.id==payment.c.student_id).where(payment.c.month_ref==month)
         if filtro_coach != "(todos)":
@@ -607,7 +643,7 @@ def page_receber(role: str):
                 except SQLAlchemyError as e:
                     st.error(f"Erro ao excluir: {e}")
         with c2:
-            if st.button("Excluir TODOS deste mês"):
+            if st.button('Excluir TODOS deste mês'):
                 try:
                     with engine.begin() as conn:
                         conn.execute(delete(payment).where(payment.c.month_ref==month))
@@ -626,7 +662,7 @@ def page_extras(role: str):
                 min_value=START_MIN, max_value=GRADE_MAX, format="DD/MM/YYYY",
             )
         with col2:
-            month_ref = st.text_input("Mês de referência (AAAA-MM)", value=TODAY.strftime("%Y-%m"))
+            month_ref = st.text_input("Mês de referência (AAAA-MM)", value=this_month_ref())
         with col3:
             desc = st.text_input("Descrição")
         col4, col5, col6 = st.columns([1,1,2])
@@ -655,7 +691,7 @@ def page_extras(role: str):
             st.error(f"Erro ao salvar: {e}")
 
     st.subheader("Lista de extras por mês")
-    m = st.text_input("Mês (AAAA-MM)", value=TODAY.strftime("%Y-%m"), key="list_extra_month")
+    m = st.text_input("Mês (AAAA-MM)", value=this_month_ref(), key="list_extra_month")
     with engine.begin() as conn:
         rows = conn.execute(select(extra_repasse).where(extra_repasse.c.month_ref==m)
                             .order_by(extra_repasse.c.date.desc(), extra_repasse.c.id.desc())).mappings().all()
@@ -684,7 +720,7 @@ def page_relatorios(role: str):
     st.header("Relatórios")
     coaches = fetch_coaches()
     cfilter = st.selectbox("Professor (opcional)", ["(todos)"] + [c["name"] for c in coaches])
-    month = st.text_input("Mês (AAAA-MM)", value=TODAY.strftime("%Y-%m"))
+    month = st.text_input("Mês (AAAA-MM)", value=this_month_ref())
 
     with engine.begin() as conn:
         q = (select(payment, student.c.name.label("aluno"),
@@ -705,6 +741,7 @@ def page_relatorios(role: str):
     st.subheader("Mensalidades (alunos)")
     if pag.empty:
         st.info("Sem pagamentos no mês.")
+        total_rep = 0.0
     else:
         def idade(dt: Optional[date]) -> str:
             if not dt:
@@ -732,16 +769,13 @@ def page_relatorios(role: str):
         )
         show["Data"] = pd.to_datetime(show["Data"]).dt.strftime("%d/%m/%Y")
         st.dataframe(show, use_container_width=True, hide_index=True)
-
-        total_pag = float(pag["amount"].astype(float).sum())
         total_rep = float(pag["master_amount"].astype(float).sum())
-        m1, m2 = st.columns(2)
-        m1.metric("Total de mensalidades", fmt_money(total_pag))
-        m2.metric("Total de repasse (mensalidades)", fmt_money(total_rep))
+        st.metric("Total de repasse (mensalidades)", fmt_money(total_rep))
 
     st.subheader("Extras (detalhado)")
     if ext.empty:
         st.info("Sem extras no mês.")
+        total_ext = 0.0
     else:
         ext["Data"] = pd.to_datetime(ext["date"]).dt.strftime("%d/%m/%Y")
         ext["Valor (R$)"] = ext["amount"].apply(fmt_money)
@@ -751,10 +785,9 @@ def page_relatorios(role: str):
         total_ext = float(ext["amount"].astype(float).sum())
         st.metric("Total (extras)", fmt_money(total_ext))
 
-    st.subheader("Total geral (mensalidades + extras)")
-    total_geral = (float(pag["amount"].astype(float).sum()) if not pag.empty else 0.0) + \
-                  (float(ext["amount"].astype(float).sum()) if not ext.empty else 0.0)
-    st.metric("Total geral", fmt_money(total_geral))
+    st.subheader("Total geral (repasse + extras)")
+    total_geral = total_rep + total_ext
+    st.metric("Total geral (a repassar)", fmt_money(total_geral))
 
 def page_config(role: str):
     st.header("Configurações")
