@@ -1,4 +1,5 @@
-# streamlit_app.py — v2.6.3
+# streamlit_app.py — pronto para SQLite (local) e Postgres/Neon (Cloud)
+
 from __future__ import annotations
 
 import os
@@ -28,7 +29,7 @@ with col_title:
     st.title("Gestão da Turma de Muay Thai")
 
 # -----------------------------------------------
-# Constantes & Conexão
+# Constantes
 # -----------------------------------------------
 ALLOWED_GRADES = [
     "Branca", "Amarelo", "Amarelo e Branca", "Verde", "Verde e Branca",
@@ -37,12 +38,18 @@ ALLOWED_GRADES = [
 ]
 
 DB_PATH = "muaythai.db"
-engine = create_engine(f"sqlite:///{DB_PATH}", echo=False)
+
+# -----------------------------------------------
+# Conexão de Banco (Postgres via secrets/ambiente; fallback SQLite)
+# -----------------------------------------------
+DB_URL = st.secrets.get("DATABASE_URL") or os.getenv("DATABASE_URL") or f"sqlite:///{DB_PATH}"
+engine = create_engine(DB_URL, pool_pre_ping=True)
+IS_SQLITE = engine.url.get_backend_name().startswith("sqlite")
+
 SQLModel.metadata.clear()  # evita conflito de definição em reloads
 
 # -----------------------------------------------
 # Models
-# (sem index=True nos Fields para não recriar índices antigos automaticamente)
 # -----------------------------------------------
 class Settings(SQLModel, table=True):
     __tablename__ = "settings"
@@ -120,26 +127,29 @@ class Payment(SQLModel, table=True):
 # DB Init & Migrações
 # -----------------------------------------------
 def init_db():
-    # drop de índices antigos/duplicados antes de recriar o schema
-    with engine.begin() as conn:
-        try:
-            rows = conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
-            for (idx_name,) in rows:
-                # remove todos ix_* e quaisquer índices antigos
-                if idx_name.startswith("ix_") or idx_name.startswith("idx_") or idx_name.startswith("sqlite_autoindex"):
-                    try:
-                        conn.exec_driver_sql(f'DROP INDEX IF EXISTS "{idx_name}"')
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+    # Para SQLite: limpamos índices "ix_*" antigos; em Postgres não é necessário.
+    if IS_SQLITE:
+        with engine.begin() as conn:
+            try:
+                rows = conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
+                for (idx_name,) in rows:
+                    if idx_name.startswith(("ix_", "idx_", "sqlite_autoindex")):
+                        try:
+                            conn.exec_driver_sql(f'DROP INDEX IF EXISTS "{idx_name}"')
+                        except Exception:
+                            pass
+            except Exception:
+                pass
     SQLModel.metadata.create_all(engine)
     with Session(engine) as session:
         if not session.exec(select(Settings)).first():
             session.add(Settings())
-            session.commit()
+        session.commit()
 
 def migrate_db():
+    """Migrações somente para SQLite legado."""
+    if not IS_SQLITE:
+        return
     import sqlite3
     conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
     # student: colunas novas
@@ -170,16 +180,16 @@ def migrate_db():
     conn.close()
 
 def ensure_coach_full_pass_column():
-    # cria a coluna full_pass em coach se não existir
+    """Garante coluna full_pass no SQLite legado. No Postgres novo, a tabela já nasce com a coluna."""
+    if not IS_SQLITE:
+        return
     try:
         with engine.begin() as conn:
             conn.exec_driver_sql("ALTER TABLE coach ADD COLUMN full_pass BOOLEAN DEFAULT 0")
     except Exception:
-        # já existe ou outra condição segura de ignorar
-        pass
+        pass  # já existe
 
-
-    # Migrar textos legados coach/train_time -> FKs
+    # Migrar textos legados coach/train_time -> FKs (só SQLite antigo tinha isso)
     with Session(engine) as session:
         students = list(session.exec(select(Student)))
         for s in students:
@@ -229,13 +239,20 @@ def list_train_slots() -> List[TrainSlot]:
     with Session(engine) as session:
         return list(session.exec(select(TrainSlot).order_by(TrainSlot.label)))
 
-def add_coach(name: str) -> int:
+def add_coach(name: str, full_pass: bool = False) -> int:
     name = (name or "").strip()
-    if not name: return 0
+    if not name:
+        return 0
     with Session(engine) as session:
         ex = session.exec(select(Coach).where(Coach.name == name)).first()
-        if ex: return ex.id
-        c = Coach(name=name); session.add(c); session.commit(); session.refresh(c); return c.id
+        if ex:
+            # Atualiza full_pass, caso queira marcar depois
+            ex.full_pass = bool(full_pass)
+            session.add(ex); session.commit(); session.refresh(ex)
+            return ex.id
+        c = Coach(name=name, full_pass=bool(full_pass))
+        session.add(c); session.commit(); session.refresh(c)
+        return c.id
 
 def delete_coach(cid: int):
     with Session(engine) as session:
@@ -251,7 +268,6 @@ def set_coach_full_pass(coach_id: int, full_pass: bool):
         if c:
             c.full_pass = bool(full_pass)
             session.add(c); session.commit()
-
 
 def add_train_slot(label: str) -> int:
     label = (label or "").strip()
@@ -269,7 +285,6 @@ def delete_train_slot(tid: int):
         if t: session.delete(t)
         session.commit()
 
-
 def add_student(
     *,
     name: str,
@@ -279,10 +294,9 @@ def add_student(
     active: bool = True,
     coach_id: int | None = None,
     train_slot_id: int | None = None,
-    master_percent: float | None = None,
     master_percent_override: float | None = None,
 ) -> int:
-    """Cria aluno e retorna o ID. Usa override de repasse se informado."""
+    """Cria aluno e retorna o ID."""
     with Session(engine) as session:
         stu = Student(
             name=name,
@@ -292,7 +306,7 @@ def add_student(
             active=active,
             coach_id=coach_id,
             train_slot_id=train_slot_id,
-            master_percent=(master_percent_override if master_percent_override is not None else master_percent),
+            master_percent_override=master_percent_override,
         )
         session.add(stu)
         session.commit()
@@ -385,14 +399,6 @@ def paid_ids_for_month(month_ref: str) -> set[int]:
     except Exception:
         return set()
 
-
-def add_extra(month_ref: str, description: str, amount: float, date_val: date,
-              student_id: Optional[int] = None, is_recurring: bool = False):
-    with Session(engine) as session:
-        e = ExtraRepasse(month_ref=month_ref, description=description, amount=amount,
-                         extra_date=date_val, student_id=student_id, is_recurring=is_recurring)
-        session.add(e); session.commit()
-
 def get_extras(month_ref: Optional[str] = None) -> pd.DataFrame:
     with Session(engine) as session:
         rows = list(session.exec(select(ExtraRepasse)))
@@ -475,7 +481,7 @@ def update_student(
     active: bool | None = None,
     coach_id: int | None = None,
     train_slot_id: int | None = None,
-    master_percent: float | None = None,
+    master_percent: float | None = None,  # mantido para compatibilidade; ignorado
     master_percent_override: float | None = None,
     grade: str | None = None,
     grade_date: date | None = None,
@@ -492,16 +498,11 @@ def update_student(
         if active is not None: obj.active = active
         if coach_id is not None: obj.coach_id = coach_id
         if train_slot_id is not None: obj.train_slot_id = train_slot_id
-        if master_percent is not None: obj.master_percent = master_percent
+        # master_percent (sem uso) fica ignorado
         if master_percent_override is not None: obj.master_percent_override = master_percent_override
         if grade is not None: obj.grade = grade
         if grade_date is not None: obj.grade_date = grade_date
         session.add(obj); session.commit()
-
-
-
-
-
 
 def month_key(d: date) -> str:
     return d.strftime("%Y-%m")
@@ -535,12 +536,8 @@ def fmt_duration_months(m):
     m_txt = "mês" if meses == 1 else "meses"
     return f"{anos} {a_txt} e {meses} {m_txt}"
 
-
-
-
-
 def delete_student(student_id: int) -> int:
-    """Exclui o aluno e seus pagamentos/graduações associados (via ON DELETE RESTRICT/NULL se houver)."""
+    """Exclui o aluno (pagamentos/extras podem continuar por histórico)."""
     with Session(engine) as s:
         obj = s.get(Student, student_id)
         if not obj:
@@ -548,6 +545,7 @@ def delete_student(student_id: int) -> int:
         s.delete(obj)
         s.commit()
         return 1
+
 def delete_payments(payment_ids: list[int]) -> int:
     """Delete payments by primary key IDs."""
     if not payment_ids:
@@ -575,7 +573,6 @@ def delete_all_payments_month(month_ref: str) -> int:
         session.commit()
     return n
 
-
 def delete_graduations(grad_ids: list[int]) -> int:
     """Exclui graduações pelos IDs e atualiza a graduação atual do(s) aluno(s)."""
     if not grad_ids:
@@ -593,7 +590,6 @@ def delete_graduations(grad_ids: list[int]) -> int:
             except Exception:
                 pass
         session.commit()
-    # Recalcula graduação atual para cada aluno afetado
     for sid in affected_students:
         try:
             refresh_student_grade(int(sid))
@@ -602,12 +598,15 @@ def delete_graduations(grad_ids: list[int]) -> int:
     return deleted
 
 # -----------------------------------------------
-# UI base
+# Bootstrap do app (criar tabelas / migrar legado)
 # -----------------------------------------------
-ensure_coach_full_pass_column(); cfg = get_settings()
+init_db()
+migrate_db()               # só faz algo no SQLite
+ensure_coach_full_pass_column()   # só age no SQLite
+cfg = get_settings()
 
 with st.sidebar:
-    st.caption("Versão: v2.12.20")
+    st.caption("Versão: v2.13.0 (Cloud ready)")
     st.caption(f"Script: {os.path.basename(__file__)}")
     st.caption("Logo: OK" if os.path.exists("logo.png") else "Logo: arquivo 'logo.png' não encontrado")
     st.header("Navegação")
@@ -643,7 +642,16 @@ if page == "Alunos":
     if st.button("➕ Adicionar aluno", use_container_width=True, key="btn_add_aluno"):
         coach_id = next((c.id for c in get_coaches() if c.name == n_coach), None) if n_coach != "(selecione)" else None
         slot_id = next((t.id for t in get_train_slots() if t.label == n_slot), None) if n_slot != "(selecione)" else None
-        add_student(name=n_name, birth_date=n_birth, start_date=n_start, monthly_fee=float(n_fee or 0.0), active=True, coach_id=coach_id, train_slot_id=slot_id, master_percent_override=(override/100.0 if use_override else None))
+        add_student(
+            name=n_name,
+            birth_date=n_birth,
+            start_date=n_start,
+            monthly_fee=float(n_fee or 0.0),
+            active=True,
+            coach_id=coach_id,
+            train_slot_id=slot_id,
+            master_percent_override=(override/100.0 if use_override else None)
+        )
         st.success("Aluno cadastrado!")
         st.rerun()
 
@@ -681,7 +689,6 @@ if page == "Alunos":
                     "Data da graduação": fmt_date(s.grade_date) if s.grade_date else "—",
                     "Ativo?": "Sim" if s.active else "Não",
                 })
-        import pandas as pd
         df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["ID","Selecionar","Nome","Idade","Tempo de treino","Mensalidade","Repasse específico","Professor","Horário","Graduação atual","Data da graduação","Ativo?"])
         df = df.sort_values("Nome") if not df.empty else df
 
@@ -766,8 +773,9 @@ if page == "Alunos":
                         delete_student(stu.id)
                         st.success("Aluno excluído.")
                         st.rerun()
-# Página: Graduações
 
+# -----------------------------------------------
+# Página: Graduações
 # -----------------------------------------------
 elif page == "Graduações":
     st.subheader("Histórico de Graduações por Aluno")
@@ -902,7 +910,6 @@ elif page == "Receber Pagamento":
                     else:
                         st.info("Não há pagamentos neste mês.")
                 st.caption("Dica: use o filtro de mês acima. Excluir todos remove todos deste mês.")
-# -----------------------------------------------
 
 # -----------------------------------------------
 # Página: Extras (Repasse)
@@ -962,9 +969,10 @@ elif page == "Extras (Repasse)":
                 n = delete_extra_repasse(dfe["id"].tolist())
                 st.success(f"Todos os {n} lançamentos listados foram excluídos.")
                 st.rerun()
+
+# -----------------------------------------------
 # Página: Relatórios
 # -----------------------------------------------
-
 elif page == "Relatórios":
     st.subheader("Relatórios de repasse")
     # --- visual cards css ---
@@ -1012,14 +1020,12 @@ elif page == "Relatórios":
     id2stu = {s.id: s for s in students_all}
     id2name = {s.id: s.name for s in students_all}
 
-    # -----------------------------------------------------
-    # 1) RELATÓRIO DE REPASSE DE MENSALIDADES (DETALHADO)
-    # -----------------------------------------------------
+    # 1) REPASSE MENSALIDADES (DETALHADO)
     st.markdown("## 💵 Relatório de repasse de mensalidades (detalhado)")
     dfp = get_payments(month_ref=mes_ref)
     if dfp is not None and not dfp.empty:
         pag = dfp.copy()
-        # aplicar filtro por professor
+        # filtro por professor
         if coach_id_filter is not None:
             def _coach_of_payment(stu_id):
                 stn = id2stu.get(int(stu_id)) if pd.notna(stu_id) else None
@@ -1027,7 +1033,6 @@ elif page == "Relatórios":
             pag = pag[pag["student_id"].apply(_coach_of_payment) == coach_id_filter]
 
         if not pag.empty:
-            # enriquecer
             pag["Aluno"] = pag["student_id"].map(id2name)
             pag["Idade"] = pag["student_id"].apply(lambda i: idade_atual(id2stu[int(i)].birth_date) if int(i) in id2stu else "")
             pag["Tempo de treino"] = pag["student_id"].apply(lambda i: fmt_duration_months(tempo_meses(id2stu[int(i)])) if int(i) in id2stu else "")
@@ -1058,16 +1063,12 @@ elif page == "Relatórios":
 
     st.markdown("---")
 
-    # ------------------------------------
-    # 2) RELATÓRIO DE EXTRAS (DETALHADO)
-    # ------------------------------------
+    # 2) EXTRAS (DETALHADO)
     st.markdown("## ➕ Relatório de extras (detalhado)")
     dfe = get_extras(month_ref=mes_ref)
     if dfe is not None and not dfe.empty:
         extras = dfe.copy()
 
-        # Aplicar filtro por professor: mantém extras do(s) alunos do professor.
-        # "Outros" (sem student_id) só aparece quando filtro = (todos)
         if coach_id_filter is not None:
             def _coach_match(v):
                 try:
@@ -1077,11 +1078,11 @@ elif page == "Relatórios":
                 except Exception:
                     return False
             extras = extras[extras["student_id"].apply(_coach_match)]
-        # Enriquecer exibição
+
         extras["Data"] = pd.to_datetime(extras["extra_date"]).dt.strftime("%d/%m/%Y")
         def _aluno_nome_row(v):
             try:
-                if pd.isna(v):  # na: "Outros"
+                if pd.isna(v):
                     return "Outros"
             except Exception:
                 pass
@@ -1096,7 +1097,6 @@ elif page == "Relatórios":
         extras["Recorrente?"] = extras["is_recurring"].apply(lambda b: "Sim" if b else "Não")
 
         cols_ex = ["Data","Aluno","Descrição","Valor (R$)","Recorrente?"]
-        # Se filtro por professor estiver ativo, "Outros" são ocultos
         if coach_id_filter is not None:
             extras = extras[extras["Aluno"] != "Outros"]
 
@@ -1107,7 +1107,6 @@ elif page == "Relatórios":
         with e2:
             st.markdown(f'<div class="card card--extras"><div class="label">➕ Total (extras detalhados)</div><div class="value">{money(total_extras, cfg.currency_symbol)}</div></div>', unsafe_allow_html=True)
 
-        # Export CSV de extras
         out_csv_ext = extras[["Data","Aluno","Descrição","Valor (R$)","Recorrente?"]].to_csv(index=False).encode("utf-8-sig")
         st.download_button("⬇️ Exportar extras (CSV)", data=out_csv_ext, file_name=f"extras_detalhe_{mes_ref}.csv", mime="text/csv", use_container_width=True)
     else:
@@ -1116,9 +1115,7 @@ elif page == "Relatórios":
 
     st.markdown("---")
 
-    # ----------------------------
-    # SOMATÓRIO FINAL (2 tabelas)
-    # ----------------------------
+    # SOMATÓRIO FINAL
     m1, m2, m3 = st.columns(3)
     with m1:
         st.markdown(f'<div class="card card--mensal"><div class="label">💵 Mensalidades</div><div class="value">{money(total_pagamentos_repasse, cfg.currency_symbol)}</div></div>', unsafe_allow_html=True)
@@ -1127,7 +1124,9 @@ elif page == "Relatórios":
     with m3:
         st.markdown(f'<div class="card card--total"><div class="label">🧮 Total geral</div><div class="value">{money(total_pagamentos_repasse + total_extras, cfg.currency_symbol)}</div></div>', unsafe_allow_html=True)
 
-
+# -----------------------------------------------
+# Página: Importar / Exportar
+# -----------------------------------------------
 elif page == "Importar / Exportar":
     st.subheader("Importar alunos de CSV")
     st.caption("Colunas: name, birth_date(DD/MM/AAAA/AAAA-MM-DD), start_date(DD/MM/AAAA/AAAA-MM-DD), active(True/False/X), monthly_fee, master_percent_override(0-1), coach_name, train_slot_label")
@@ -1149,12 +1148,21 @@ elif page == "Importar / Exportar":
                 train_label = None if pd.isna(row.get("train_slot_label")) else str(row.get("train_slot_label")).strip()
                 coach_id = add_coach(coach_name) if coach_name else None
                 slot_id = add_train_slot(train_label) if train_label else None
-                add_student(Student(name=str(row.get("name")), birth_date=bd, start_date=sd, active=active, monthly_fee=monthly_fee,
-                                    master_percent_override=override, coach_id=coach_id, train_slot_id=slot_id))
+                add_student(
+                    name=str(row.get("name")),
+                    birth_date=bd,
+                    start_date=sd,
+                    active=active,
+                    monthly_fee=monthly_fee,
+                    master_percent_override=override,
+                    coach_id=coach_id,
+                    train_slot_id=slot_id
+                )
                 ok += 1
             except Exception:
                 fail += 1
         st.success(f"Importação finalizada — {ok} inseridos, {fail} erros.")
+
     st.markdown("---"); st.subheader("Exportar base completa")
     students = get_students(False); df_students = pd.DataFrame([s.model_dump() for s in students]) if students else pd.DataFrame()
     payments = get_payments(); extras = get_extras()
@@ -1169,7 +1177,6 @@ elif page == "Importar / Exportar":
 # -----------------------------------------------
 # Página: Configurações
 # -----------------------------------------------
-
 elif page == "Configurações":
     st.subheader("Preferências")
     cfg = get_settings()
@@ -1177,8 +1184,10 @@ elif page == "Configurações":
     sym = st.text_input("Símbolo de moeda", value=cfg.currency_symbol)
     if st.button("💾 Salvar configurações", use_container_width=True):
         save_settings(perc/100.0, sym); st.success("Configurações salvas!")
+
     st.markdown("---")
     st.subheader("📋 Cadastros auxiliares")
+
     st.markdown("#### 👨‍🏫 Professores")
     new_coach = st.text_input("Novo professor (nome)")
     new_full = st.checkbox("Repasse completo (100%)", key="new_coach_full")
@@ -1198,7 +1207,9 @@ elif page == "Configurações":
             if c3.button("Excluir", key=f"delc_{c.id}"):
                 delete_coach(c.id); st.warning(f"Professor '{c.name}' excluído.")
     else: st.info("Nenhum professor cadastrado.")
-    st.markdown("---"); st.markdown("#### 🕒 Horários de Treino")
+
+    st.markdown("---")
+    st.markdown("#### 🕒 Horários de Treino")
     new_slot = st.text_input("Novo horário (ex.: Ter/Qui 19h-20h)")
     if st.button("➕ Adicionar horário"):
         if not new_slot.strip(): st.warning("Informe um horário/descrição.")
@@ -1211,6 +1222,9 @@ elif page == "Configurações":
                 delete_train_slot(t.id); st.warning(f"Horário '{t.label}' excluído.")
     else: st.info("Nenhum horário cadastrado.")
 
+# -----------------------------------------------
+# Funções de Extras (CRUD)
+# -----------------------------------------------
 def add_extra_repasse(description: str, amount: float, date_val: date, month_ref: str, is_recurring: bool = False, student_id: Optional[int] = None) -> int:
     """Cria um lançamento extra. 'amount' pode ser negativo (desconto). Se is_recurring=True, aplica mês a mês a partir do mês de lançamento."""
     with Session(engine) as session:
@@ -1223,7 +1237,6 @@ def add_extra_repasse(description: str, amount: float, date_val: date, month_ref
         session.add(e); session.commit(); session.refresh(e)
         return int(e.id)
 
-
 def update_extra_repasse(extra_id: int, **fields) -> int:
     with Session(engine) as session:
         obj = session.get(ExtraRepasse, extra_id)
@@ -1234,7 +1247,6 @@ def update_extra_repasse(extra_id: int, **fields) -> int:
                 setattr(obj, k, v)
         session.add(obj); session.commit()
         return 1
-
 
 def delete_extra_repasse(ids: list[int]) -> int:
     if not ids: return 0
