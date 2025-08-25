@@ -1,923 +1,879 @@
-# -*- coding: utf-8 -*-
-import os, math
+# streamlit_app.py
+# JAT - Gestão de alunos (Muay Thai)
+# Tecnologias: Streamlit + SQLAlchemy Core + Postgres (Neon)
+# Esquema esperado no banco:
+#   settings(id, master_percent)
+#   coach(id, name, full_pass)
+#   train_slot(id, name)
+#   student(id, name, birth_date, start_date, monthly_fee, active, master_percent_override, coach_id, train_slot_id)
+#   graduation_history(id, student_id, grade, grade_date, notes)
+#   payment(id, student_id, paid_date, month_ref, amount, method, notes, master_percent_used, master_adjustment, master_amount)
+#   extra_repasse(id, student_id, description, amount, month_ref, is_recurring, created_at)
+
+from __future__ import annotations
+
+import os
 from datetime import date, datetime
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import (
-    create_engine, MetaData, Table, select, insert, update, delete,
-    text, or_
+    create_engine, MetaData, Table, Column, Integer, String, Date, DateTime, Boolean,
+    Numeric, select, insert, update, delete, and_, or_, func, text
 )
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import NoSuchTableError
 
-# =========================================================
-# CONFIG / BRAND
-# =========================================================
-APP_TITLE = "JAT - Gestão de alunos"
+# -----------------------------------------------------------------------------
+# Configuração básica
+# -----------------------------------------------------------------------------
 
-HERE = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
-LOGO_PATH = os.path.join(HERE, "logo.png")
-PAGE_ICON = LOGO_PATH if os.path.isfile(LOGO_PATH) else "🥋"
+st.set_page_config(page_title="JAT - Gestão de alunos", page_icon="logo.png", layout="wide")
 
-st.set_page_config(page_title=APP_TITLE, page_icon=PAGE_ICON, layout="wide")
+# Tenta pegar URL do banco
+DB_URL = st.secrets.get("DATABASE_URL") or os.getenv("DATABASE_URL")
 
-# Se existir, mostra o logo no topo
-if os.path.isfile(LOGO_PATH):
-    col_logo, col_title = st.columns([1, 6])
-    with col_logo:
-        st.image(LOGO_PATH, use_container_width=True)
-    with col_title:
-        st.title(APP_TITLE)
-else:
-    st.title(APP_TITLE)
+# Caso não encontre, cai para SQLite local (apenas para desenvolvimento)
+if not DB_URL:
+    DB_URL = "sqlite:///muaythai.db"
 
-# =========================================================
-# DB / TABLE NAMES
-# =========================================================
-DB_URL = (
-    st.secrets.get("DATABASE_URL")
-    or os.getenv("DATABASE_URL")
-    or f"sqlite:///{os.path.join(HERE, 'muaythai.db')}"
-)
+# -----------------------------------------------------------------------------
+# Helpers de formatação/calculo
+# -----------------------------------------------------------------------------
 
-T_STUDENT     = "student"
-T_GRADUATION  = "graduation_history"
-T_PAYMENT     = "payment"
-T_EXTRA       = "extra_repasse"
-T_SETTINGS    = "settings"
-T_COACH       = "coach"
-T_SLOT        = "train_slot"
-
-BIRTH_MIN, BIRTH_MAX = date(1900,1,1), date.today()
-TRAIN_MIN, TRAIN_MAX = date(1990,1,1), date.today()
-
-GRADE_CHOICES = [
-    "Branca","Amarelo","Amarelo e Branca","Verde","Verde e Branca",
-    "Azul","Azul e Branca","Marrom","Marrom e Branca","Vermelha",
-    "Vermelha e Branca","Preta"
+GRADES = [
+    "Branca",
+    "Amarelo", "Amarelo e Branca",
+    "Verde", "Verde e Branca",
+    "Azul", "Azul e Branca",
+    "Marrom", "Marrom e Branca",
+    "Vermelha", "Vermelha e Branca",
+    "Preta",
 ]
 
-# =========================================================
-# ENGINE / REFLECTION
-# =========================================================
-@st.cache_resource(show_spinner=False)
-def get_engine() -> Engine:
-    return create_engine(DB_URL, pool_pre_ping=True, future=True)
-
-engine: Engine = get_engine()
-metadata = MetaData()
-
-def reflect_table(name: str) -> Optional[Table]:
+def fmt_currency(x: Optional[float]) -> str:
     try:
-        return Table(name, metadata, autoload_with=engine)
-    except NoSuchTableError:
-        return None
-
-def has_col(tbl: Optional[Table], col: str) -> bool:
-    return (tbl is not None) and (col in tbl.c)
-
-def _dialect() -> str:
-    try:
-        return engine.dialect.name or ""
+        return "R$ {:,.2f}".format(float(x)).replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
-        return ""
+        return "R$ 0,00"
 
-# =========================================================
-# FLASH MESSAGES (persistem após rerun)
-# =========================================================
-def flash(kind: str, msg: str):
-    st.session_state.setdefault("_flash", []).append((kind, msg))
-
-def show_flashes():
-    if st.session_state.get("_flash"):
-        for kind, msg in st.session_state["_flash"]:
-            if   kind == "success": st.success(msg)
-            elif kind == "warning": st.warning(msg)
-            elif kind == "error":   st.error(msg)
-            else:                   st.info(msg)
-        st.session_state["_flash"] = []
-
-show_flashes()
-
-# =========================================================
-# HELPERS
-# =========================================================
 def fmt_date(d: Optional[date]) -> str:
-    if d in (None, "", "None"): return "—"
-    if isinstance(d, str):
-        try: d = datetime.fromisoformat(d).date()
-        except Exception: return d
+    if not d:
+        return "—"
     return d.strftime("%d/%m/%Y")
 
-def parse_date(v: Any) -> Optional[date]:
-    if v in (None, "", "—"): return None
-    if isinstance(v, date): return v
-    try:
-        if isinstance(v, str) and "/" in v:
-            return datetime.strptime(v, "%d/%m/%Y").date()
-        return datetime.fromisoformat(str(v)).date()
-    except Exception:
+def parse_date(obj) -> Optional[date]:
+    if obj is None or obj == "":
         return None
+    if isinstance(obj, date):
+        return obj
+    if isinstance(obj, datetime):
+        return obj.date()
+    try:
+        return datetime.strptime(str(obj), "%Y-%m-%d").date()
+    except Exception:
+        try:
+            return datetime.strptime(str(obj), "%d/%m/%Y").date()
+        except Exception:
+            return None
 
-def idade_atual(dn: Any) -> str:
-    dn = parse_date(dn)
-    if not dn: return "—"
+def month_of(d: date) -> str:
+    return d.strftime("%Y-%m")
+
+def idade_anos(dt_nasc: Optional[date]) -> str:
+    if not dt_nasc:
+        return "—"
     today = date.today()
-    years = today.year - dn.year - ((today.month, today.day) < (dn.month, dn.day))
+    years = today.year - dt_nasc.year - ((today.month, today.day) < (dt_nasc.month, dt_nasc.day))
     return f"{years} anos"
 
-def tempo_treino_fmt(dt_inicio: Any) -> str:
-    di = parse_date(dt_inicio)
-    if not di: return "—"
+def tempo_treino(dt_ini: Optional[date]) -> str:
+    if not dt_ini:
+        return "—"
     today = date.today()
-    months = (today.year - di.year) * 12 + (today.month - di.month)
-    if today.day < di.day: months -= 1
-    if months < 0: months = 0
-    anos, meses = months // 12, months % 12
-    return f"{anos} anos e {meses} meses" if anos > 0 else f"{meses} meses"
+    months = (today.year - dt_ini.year) * 12 + (today.month - dt_ini.month)
+    if today.day < dt_ini.day:
+        months -= 1
+    if months < 12:
+        return f"{months} meses"
+    anos = months // 12
+    rest = months % 12
+    return f"{anos} anos e {rest} meses" if rest else f"{anos} anos"
 
-def money(v: Any) -> str:
-    try: f = float(v or 0)
-    except: f = 0.0
-    s = f"{f:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    return f"R$ {s}"
+# -----------------------------------------------------------------------------
+# Conexão e tabelas (fixas, alinhadas ao schema)
+# -----------------------------------------------------------------------------
 
-# =========================================================
-# LOGIN
-# =========================================================
-def _do_login():
-    st.sidebar.subheader("🔐 Login")
-    u = st.sidebar.text_input("Usuário")
-    p = st.sidebar.text_input("Senha", type="password")
-    if st.sidebar.button("Entrar", type="primary", use_container_width=True):
-        users_section = st.secrets.get("users", {}) or {
-            "admin": st.secrets.get("admin", ""),
-            "operador": st.secrets.get("operador", ""),
-        }
-        users = {
-            "admin": {"pw": users_section.get("admin",""), "role": "admin"},
-            "operador": {"pw": users_section.get("operador",""), "role": "operador"},
-        }
-        u_in, p_in = (u or "").strip().lower(), (p or "").strip()
-        if u_in in users and p_in == users[u_in]["pw"] and p_in != "":
-            st.session_state["user"], st.session_state["role"] = u_in, users[u_in]["role"]
-            flash("success", f"Bem-vindo, {u_in}!")
-            st.rerun()
-        else:
-            st.sidebar.error("Usuário ou senha inválidos.")
-    st.stop()
+@st.cache_resource(show_spinner=False)
+def get_engine() -> Engine:
+    # psycopg3 precisa de ?sslmode=require no Neon
+    engine = create_engine(DB_URL, pool_pre_ping=True, future=True)
+    return engine
 
-if "role" not in st.session_state: _do_login()
-with st.sidebar:
-    st.caption(f"Usuário: **{st.session_state['user']}** · Perfil: **{st.session_state['role']}**")
-    if st.button("Sair", use_container_width=True):
-        for k in ("user","role"): st.session_state.pop(k, None)
-        flash("info", "Sessão encerrada.")
-        st.rerun()
+engine = get_engine()
+metadata = MetaData()
 
-def require_admin():
-    if st.session_state["role"] != "admin":
-        st.warning("Somente o administrador pode acessar esta seção.")
-        st.stop()
+T_SETTINGS  = "settings"
+T_COACH     = "coach"
+T_SLOT      = "train_slot"
+T_STUDENT   = "student"
+T_GH        = "graduation_history"
+T_PAY       = "payment"
+T_EXTRA     = "extra_repasse"
 
-# =========================================================
-# SETTINGS / DATA LOADERS
-# =========================================================
-@st.cache_data(ttl=30)
-def get_settings() -> Dict[str, Any]:
-    tbl = reflect_table(T_SETTINGS)
-    if tbl is None: return {}
+settings = Table(
+    T_SETTINGS, metadata,
+    Column("id", Integer, primary_key=True),
+    Column("master_percent", Numeric(7,4), nullable=False),
+    Column("created_at", DateTime(timezone=True), server_default=func.now())
+)
+
+coach = Table(
+    T_COACH, metadata,
+    Column("id", Integer, primary_key=True),
+    Column("name", String, nullable=False),
+    Column("full_pass", Boolean, nullable=False, server_default=text("false")),
+    Column("created_at", DateTime(timezone=True), server_default=func.now())
+)
+
+slot = Table(
+    T_SLOT, metadata,
+    Column("id", Integer, primary_key=True),
+    Column("name", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), server_default=func.now())
+)
+
+student = Table(
+    T_STUDENT, metadata,
+    Column("id", Integer, primary_key=True),
+    Column("name", String, nullable=False),
+    Column("birth_date", Date),
+    Column("start_date", Date),
+    Column("monthly_fee", Numeric(12,2), nullable=False, server_default="0"),
+    Column("active", Boolean, nullable=False, server_default=text("true")),
+    Column("master_percent_override", Numeric(7,4)),
+    Column("coach_id", Integer),
+    Column("train_slot_id", Integer),
+    Column("created_at", DateTime(timezone=True), server_default=func.now())
+)
+
+gh = Table(
+    T_GH, metadata,
+    Column("id", Integer, primary_key=True),
+    Column("student_id", Integer, nullable=False),
+    Column("grade", String, nullable=False),
+    Column("grade_date", Date, nullable=False),
+    Column("notes", String),
+    Column("created_at", DateTime(timezone=True), server_default=func.now())
+)
+
+pay = Table(
+    T_PAY, metadata,
+    Column("id", Integer, primary_key=True),
+    Column("student_id", Integer, nullable=False),
+    Column("paid_date", Date, nullable=False),
+    Column("month_ref", String(7), nullable=False),
+    Column("amount", Numeric(12,2), nullable=False),
+    Column("method", String(30), nullable=False),
+    Column("notes", String),
+    Column("master_percent_used", Numeric(7,4), nullable=False, server_default="0"),
+    Column("master_adjustment", Numeric(12,2), nullable=False, server_default="0"),
+    Column("master_amount", Numeric(12,2), nullable=False, server_default="0"),
+    Column("created_at", DateTime(timezone=True), server_default=func.now())
+)
+
+extra = Table(
+    T_EXTRA, metadata,
+    Column("id", Integer, primary_key=True),
+    Column("student_id", Integer),
+    Column("description", String, nullable=False),
+    Column("amount", Numeric(12,2), nullable=False),
+    Column("month_ref", String(7), nullable=False),
+    Column("is_recurring", Boolean, nullable=False, server_default=text("false")),
+    Column("created_at", Date, server_default=func.current_date())
+)
+
+# -----------------------------------------------------------------------------
+# CRUD helpers
+# -----------------------------------------------------------------------------
+
+def ensure_settings() -> Dict[str, Any]:
     with engine.begin() as conn:
-        row = conn.execute(select(tbl)).mappings().first()
-    return dict(row) if row else {}
+        row = conn.execute(select(settings)).mappings().first()
+        if not row:
+            conn.execute(insert(settings).values(master_percent=0.60))
+            row = conn.execute(select(settings)).mappings().first()
+    return dict(row)
 
-@st.cache_data(ttl=30)
-def get_coaches_df() -> pd.DataFrame:
-    tbl = reflect_table(T_COACH)
-    if tbl is None: return pd.DataFrame()
+def default_percent_for_student(stu: Dict[str, Any], coach_row: Optional[Dict[str, Any]], cfg: Dict[str, Any]) -> float:
+    """Regra: se coach.full_pass True -> 1.0; senão aluno.override se houver; senão settings.master_percent."""
+    if coach_row and coach_row.get("full_pass"):
+        return 1.0
+    if stu.get("master_percent_override") is not None:
+        return float(stu["master_percent_override"])
+    return float(cfg.get("master_percent", 0.60))
+
+def add_default_white_grade(student_id: int, start_dt: Optional[date]):
     with engine.begin() as conn:
-        rows = conn.execute(select(tbl)).mappings().all()
-    return pd.DataFrame(rows)
+        # só insere se não existir qualquer graduação ainda
+        exists = conn.execute(
+            select(func.count()).select_from(gh).where(gh.c.student_id==student_id)
+        ).scalar_one()
+        if exists == 0:
+            conn.execute(insert(gh).values(
+                student_id=student_id,
+                grade="Branca",
+                grade_date=start_dt or date.today(),
+                notes=None
+            ))
 
-@st.cache_data(ttl=30)
-def get_slots_df() -> pd.DataFrame:
-    tbl = reflect_table(T_SLOT)
-    if tbl is None: return pd.DataFrame()
+def list_coaches() -> List[Dict[str, Any]]:
     with engine.begin() as conn:
-        rows = conn.execute(select(tbl)).mappings().all()
-    return pd.DataFrame(rows)
+        rows = conn.execute(select(coach).order_by(coach.c.name)).mappings().all()
+    return [dict(r) for r in rows]
 
-def compute_share_and_percent(student_row: Dict[str, Any], amount: float) -> Tuple[float, float]:
-    """Retorna (repasse_em_reais, percentual_usado 0..1)."""
-    try:
-        # 100% para professor com flag
-        if "coach_id" in student_row and student_row.get("coach_id") is not None:
-            dfc = get_coaches_df()
-            if not dfc.empty and "id" in dfc.columns:
-                row = dfc[dfc["id"] == student_row["coach_id"]]
-                if not row.empty and "full_pass" in row.columns and bool(row.iloc[0].get("full_pass", False)):
-                    return float(amount), 1.0
-        # Override por aluno (decimal 0..1)
-        ov = student_row.get("master_percent_override")
-        if ov is not None and not (isinstance(ov, float) and math.isnan(ov)):
-            p = float(ov)
-            return float(amount) * p, p
-        # Padrão (settings)
-        cfg = get_settings()
-        if cfg.get("master_percent") is not None:
-            p = float(cfg["master_percent"])
-            return float(amount) * p, p
-    except Exception:
-        pass
-    return 0.0, 0.0
-
-def clear_data_cache():
-    for fn in (
-        fetch_students_df, fetch_grads_df, fetch_payments_df, fetch_extras_df,
-        get_settings, get_coaches_df, get_slots_df
-    ):
-        try: fn.clear()
-        except Exception: pass
-
-# =========================================================
-# CRUD GENÉRICO
-# =========================================================
-def insert_row(tbl_name: str, values: Dict[str, Any]) -> Optional[int]:
-    tbl = reflect_table(tbl_name)
-    if tbl is None: return None
-    payload = {k: v for k, v in values.items() if has_col(tbl, k)}
-    if not payload: return None
-    stmt = insert(tbl).values(**payload)
-    if has_col(tbl, "id"): stmt = stmt.returning(tbl.c.id)
+def list_slots() -> List[Dict[str, Any]]:
     with engine.begin() as conn:
-        res = conn.execute(stmt)
-        new_id = int(res.scalar_one()) if has_col(tbl, "id") else 1
-    clear_data_cache()
-    return new_id
+        rows = conn.execute(select(slot).order_by(slot.c.name)).mappings().all()
+    return [dict(r) for r in rows]
 
-def update_row(tbl_name: str, row_id: int, values: Dict[str, Any]) -> int:
-    tbl = reflect_table(tbl_name)
-    if tbl is None or not has_col(tbl, "id"): return 0
-    payload = {k: v for k, v in values.items() if has_col(tbl, k)}
-    stmt = update(tbl).where(tbl.c.id == row_id).values(**payload)
-    with engine.begin() as conn:
-        res = conn.execute(stmt)
-        n = res.rowcount or 0
-    clear_data_cache()
-    return n
-
-def delete_rows(tbl_name: str, ids: List[int]) -> int:
-    tbl = reflect_table(tbl_name)
-    if tbl is None or not has_col(tbl, "id") or not ids: return 0
-    stmt = delete(tbl).where(tbl.c.id.in_(ids))
-    with engine.begin() as conn:
-        res = conn.execute(stmt)
-        n = res.rowcount or 0
-    clear_data_cache()
-    return n
-
-# =========================================================
-# FETCH DATAFRAMES
-# =========================================================
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=20)
 def fetch_students_df() -> pd.DataFrame:
-    tbl = reflect_table(T_STUDENT)
-    if tbl is None: return pd.DataFrame()
     with engine.begin() as conn:
-        rows = conn.execute(select(tbl)).mappings().all()
-    df = pd.DataFrame(rows)
-    if df.empty: return df
+        stu_rows = conn.execute(select(student)).mappings().all()
+        c_map = {r["id"]: dict(r) for r in conn.execute(select(coach)).mappings().all()}
+        s_map = {r["id"]: dict(r) for r in conn.execute(select(slot)).mappings().all()}
+        # graduacao mais recente por aluno
+        gh_rows = conn.execute(select(gh).order_by(gh.c.student_id, gh.c.grade_date.desc())).mappings().all()
 
-    # derivados
-    if "birth_date" in df.columns: df["Idade"] = df["birth_date"].apply(idade_atual)
-    else: df["Idade"] = "—"
-    if "start_date" in df.columns: df["Tempo de treino"] = df["start_date"].apply(tempo_treino_fmt)
-    else: df["Tempo de treino"] = "—"
+    df = pd.DataFrame([dict(r) for r in stu_rows])
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "id","name","birth_date","start_date","monthly_fee","active","coach","train_slot",
+            "grade","grade_date","idade","tempo"
+        ])
 
-    # graduação atual
-    gh = reflect_table(T_GRADUATION)
-    if gh is not None and "id" in df.columns:
-        # últimas por data
-        date_cols = [c for c in ["date","grade_date","created_at"] if has_col(gh, c)]
-        dcol = date_cols[0] if date_cols else None
-        grade_col = "grade" if has_col(gh,"grade") else ("graduation" if has_col(gh,"graduation") else None)
-        if dcol and grade_col:
-            with engine.begin() as conn:
-                grads = conn.execute(text(f"""
-                    SELECT DISTINCT ON (student_id)
-                           student_id, {grade_col} AS g, {dcol} AS d
-                    FROM {T_GRADUATION}
-                    ORDER BY student_id, {dcol} DESC, id DESC
-                """)).mappings().all()
-            gmap = {r["student_id"]: (r["g"], r["d"]) for r in grads}
-            df["Graduação"] = df["id"].map(lambda i: gmap.get(i, ("Branca", None))[0])
-            df["Data Graduação"] = df["id"].map(lambda i: fmt_date(gmap.get(i, (None, None))[1]))
-        else:
-            df["Graduação"] = "Branca"; df["Data Graduação"] = "—"
-    else:
-        df["Graduação"] = "Branca"; df["Data Graduação"] = "—"
+    # map coach/slot
+    df["coach"] = df["coach_id"].map(lambda i: c_map.get(i, {}).get("name") if i else None)
+    df["train_slot"] = df["train_slot_id"].map(lambda i: s_map.get(i, {}).get("name") if i else None)
+
+    # última graduação
+    latest_grade: Dict[int, Tuple[str, date]] = {}
+    for r in gh_rows:
+        sid = int(r["student_id"])
+        if sid not in latest_grade:
+            latest_grade[sid] = (r["grade"], parse_date(r["grade_date"]))
+    df["grade"] = df["id"].map(lambda i: latest_grade.get(int(i), ("Branca", None))[0])
+    df["grade_date"] = df["id"].map(lambda i: latest_grade.get(int(i), ("Branca", None))[1])
+
+    # idade/tempo
+    df["idade"] = df["birth_date"].map(lambda d: idade_anos(parse_date(d)))
+    df["tempo"] = df["start_date"].map(lambda d: tempo_treino(parse_date(d)))
+
     return df
 
-@st.cache_data(ttl=30)
-def fetch_grads_df(student_id: Optional[int]=None) -> pd.DataFrame:
-    tbl = reflect_table(T_GRADUATION)
-    if tbl is None: return pd.DataFrame()
-    stmt = select(tbl)
-    if student_id is not None and has_col(tbl, "student_id"):
-        stmt = stmt.where(tbl.c.student_id == student_id)
-    order_col = None
-    for c in ["date","grade_date","created_at"]:
-        if has_col(tbl, c): order_col = tbl.c[c]; break
+def add_student_row(values: Dict[str, Any]) -> int:
     with engine.begin() as conn:
-        rows = conn.execute(stmt.order_by(order_col if order_col is not None else list(tbl.c.values())[0])).mappings().all()
-    return pd.DataFrame(rows)
+        rid = conn.execute(insert(student).values(**values).returning(student.c.id)).scalar_one()
+    return int(rid)
 
-@st.cache_data(ttl=30)
-def fetch_payments_df(month: Optional[str]=None) -> pd.DataFrame:
-    tbl = reflect_table(T_PAYMENT)
-    if tbl is None: return pd.DataFrame()
-    stmt = select(tbl)
-    if month and has_col(tbl, "month_ref"):
-        stmt = stmt.where(tbl.c.month_ref == month)
+def update_student_row(student_id: int, values: Dict[str, Any]) -> None:
     with engine.begin() as conn:
-        order_col = tbl.c.get("paid_date", list(tbl.c.values())[0])
-        rows = conn.execute(stmt.order_by(order_col.desc())).mappings().all()
-    return pd.DataFrame(rows)
+        conn.execute(update(student).where(student.c.id==student_id).values(**values))
 
-@st.cache_data(ttl=30)
-def fetch_extras_df(month: Optional[str]=None) -> pd.DataFrame:
-    tbl = reflect_table(T_EXTRA)
-    if tbl is None: return pd.DataFrame()
-    stmt = select(tbl)
-    if month and has_col(tbl, "month_ref"):
-        stmt = stmt.where(or_(tbl.c.month_ref == month, tbl.c.get("is_recurring", text("0")) == True))
+def record_payment(sid: int, paid_dt: date, amount_value: float, method_value: str, notes_value: Optional[str]) -> int:
+    cfg = ensure_settings()
+    # carrega aluno e coach
     with engine.begin() as conn:
-        order_col = tbl.c.get("created_at", list(tbl.c.values())[0])
-        rows = conn.execute(stmt.order_by(order_col.desc())).mappings().all()
-    return pd.DataFrame(rows)
+        stu = conn.execute(select(student).where(student.c.id==sid)).mappings().first()
+        if not stu:
+            raise RuntimeError("Aluno não encontrado")
+        c_row = None
+        if stu.get("coach_id"):
+            c_row = conn.execute(select(coach).where(coach.c.id==stu["coach_id"])).mappings().first()
+    percent = default_percent_for_student(dict(stu), dict(c_row) if c_row else None, cfg)
+    master_amount = float(amount_value) * float(percent)
+    month_ref = month_of(paid_dt)
 
-# =========================================================
-# GRAD PAYLOAD FLEXÍVEL
-# =========================================================
-def build_grad_payload(student_id: int, grade: str, when: date, notes: Optional[str]) -> Dict[str, Any]:
-    tbl = reflect_table(T_GRADUATION)
-    if tbl is None: return {}
-    payload: Dict[str, Any] = {}
-    if has_col(tbl, "student_id"): payload["student_id"] = student_id
-    # grade
-    if has_col(tbl, "grade"): payload["grade"] = grade
-    elif has_col(tbl, "graduation"): payload["graduation"] = grade
-    # date
-    if has_col(tbl, "date"): payload["date"] = when
-    elif has_col(tbl, "grade_date"): payload["grade_date"] = when
-    elif has_col(tbl, "created_at"): payload["created_at"] = when
-    # notes
-    if notes:
-        for c in ["notes","obs","observations"]:
-            if has_col(tbl, c): payload[c] = notes; break
-    return payload
+    with engine.begin() as conn:
+        rid = conn.execute(
+            insert(pay).values(
+                student_id=sid,
+                paid_date=paid_dt,
+                month_ref=month_ref,
+                amount=float(amount_value),
+                method=method_value,
+                notes=notes_value,
+                master_percent_used=percent,
+                master_adjustment=0.0,
+                master_amount=master_amount
+            ).returning(pay.c.id)
+        ).scalar_one()
+    return int(rid)
 
-# =========================================================
-# NAV
-# =========================================================
-ALL_PAGES = ["Alunos","Graduações","Receber Pagamento","Extras (Repasse)","Relatórios","Importar / Exportar","Configurações"]
-PAGES = ["Alunos","Relatórios"] if st.session_state["role"] == "operador" else ALL_PAGES
-st.sidebar.markdown("### Navegação")
-page = st.sidebar.radio("Ir para:", PAGES, index=0, label_visibility="collapsed")
+def delete_payments(ids: List[int]) -> int:
+    if not ids:
+        return 0
+    with engine.begin() as conn:
+        res = conn.execute(delete(pay).where(pay.c.id.in_(ids)))
+        return res.rowcount or 0
 
-# =========================================================
-# ALUNOS
-# =========================================================
-if page == "Alunos":
-    df_students = fetch_students_df()
-    dfc, dfs = get_coaches_df(), get_slots_df()
+# -----------------------------------------------------------------------------
+# Login simples (opcional via Secrets)
+# -----------------------------------------------------------------------------
 
-    st.subheader("Alunos cadastrados")
-    if df_students.empty:
-        st.info("Nenhum aluno.")
+def check_login() -> str:
+    """Retorna 'admin' ou 'operador'. Se não houver secrets, assume admin."""
+    admin_pwd = st.secrets.get("admin") or os.getenv("admin")
+    op_pwd    = st.secrets.get("operador") or os.getenv("operador")
+
+    if not admin_pwd and not op_pwd:
+        return "admin"
+
+    if "role" in st.session_state:
+        return st.session_state["role"]
+
+    st.title("🔐 JAT - Gestão de alunos")
+    st.caption("Faça login para continuar")
+    with st.form("login"):
+        role = st.selectbox("Perfil", ["admin", "operador"])
+        pwd  = st.text_input("Senha", type="password")
+        ok   = st.form_submit_button("Entrar", type="primary")
+        if ok:
+            if (role == "admin" and pwd == admin_pwd) or (role == "operador" and pwd == op_pwd):
+                st.session_state["role"] = role
+                st.success("Login efetuado!")
+                st.rerun()
+            else:
+                st.error("Credenciais inválidas.")
+    st.stop()
+
+# -----------------------------------------------------------------------------
+# UI — Cabeçalho
+# -----------------------------------------------------------------------------
+
+def header():
+    c1, c2 = st.columns([1,6])
+    with c1:
+        try:
+            st.image("logo.png", width=80)
+        except Exception:
+            st.write("🥊")
+    with c2:
+        st.markdown("## JAT - Gestão de alunos")
+
+# -----------------------------------------------------------------------------
+# Páginas
+# -----------------------------------------------------------------------------
+
+def page_alunos(role: str):
+    st.markdown("### 👥 Alunos")
+    df = fetch_students_df()
+
+    # Tabela principal
+    st.dataframe(
+        df[["id","name","active","monthly_fee","coach","train_slot","grade","idade","tempo"]]
+          .rename(columns={
+              "id":"ID","name":"Aluno","active":"Ativo?","monthly_fee":"Mensalidade (R$)",
+              "coach":"Professor","train_slot":"Horário","grade":"Graduação","idade":"Idade","tempo":"Tempo de treino"
+          }),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.divider()
+    st.markdown("#### ➕ Cadastrar novo aluno")
+    coaches = list_coaches()
+    slots   = list_slots()
+    coach_opts = ["(sem professor)"] + [c["name"] for c in coaches]
+    slot_opts  = ["(sem horário)"]   + [s["name"] for s in slots]
+
+    with st.form("form_add_student"):
+        col1, col2, col3 = st.columns([3,2,2])
+        with col1:
+            n_name = st.text_input("Nome *")
+        with col2:
+            n_birth = st.date_input("Data de nascimento", value=None)
+        with col3:
+            n_start = st.date_input("Início no treino", value=None)
+
+        col4, col5, col6 = st.columns([2,2,2])
+        with col4:
+            n_fee = st.number_input("Mensalidade (R$)", min_value=0.0, value=0.0, step=10.0, format="%.2f")
+        with col5:
+            c_sel = st.selectbox("Professor responsável", options=coach_opts)
+        with col6:
+            s_sel = st.selectbox("Horário do treino", options=slot_opts)
+
+        col7, col8 = st.columns([2,2])
+        with col7:
+            override_pct = st.number_input("Repasse do aluno (%) (0 = usar padrão)", min_value=0, max_value=100, step=5, value=0)
+        with col8:
+            ativo = st.checkbox("Ativo?", value=True)
+
+        submit = st.form_submit_button("Cadastrar", type="primary")
+
+    if submit:
+        if not n_name:
+            st.error("Informe o nome do aluno.")
+        else:
+            coach_id = None
+            if c_sel != coach_opts[0]:
+                coach_id = next((c["id"] for c in coaches if c["name"]==c_sel), None)
+            slot_id = None
+            if s_sel != slot_opts[0]:
+                slot_id = next((s["id"] for s in slots if s["name"]==s_sel), None)
+
+            values = {
+                "name": n_name.strip(),
+                "birth_date": n_birth,
+                "start_date": n_start,
+                "monthly_fee": float(n_fee or 0.0),
+                "active": bool(ativo),
+                "coach_id": coach_id,
+                "train_slot_id": slot_id,
+                "master_percent_override": (float(override_pct)/100.0) if override_pct>0 else None
+            }
+            rid = add_student_row(values)
+            add_default_white_grade(rid, n_start)
+            st.success(f"Aluno cadastrado (ID {rid}).")
+            st.cache_data.clear()
+            st.rerun()
+
+    st.divider()
+    st.markdown("#### ✏️ Editar aluno")
+    if df.empty:
+        st.info("Nenhum aluno cadastrado.")
+        return
+
+    sid = st.selectbox(
+        "Selecione o aluno (por ID)",
+        options=df["id"].tolist(),
+        format_func=lambda i: f"ID {i} — {df.loc[df['id']==i,'name'].values[0]}"
+    )
+    row = df[df["id"]==sid].iloc[0].to_dict()
+
+    with st.form("form_edit_student"):
+        col1, col2, col3 = st.columns([3,2,2])
+        with col1:
+            e_name = st.text_input("Nome *", value=row.get("name",""))
+        with col2:
+            e_birth = st.date_input("Data de nascimento", value=parse_date(row.get("birth_date")))
+        with col3:
+            e_start = st.date_input("Início no treino", value=parse_date(row.get("start_date")))
+
+        col4, col5, col6 = st.columns([2,2,2])
+        with col4:
+            e_fee = st.number_input("Mensalidade (R$)", min_value=0.0, value=float(row.get("monthly_fee") or 0.0), step=10.0, format="%.2f")
+        with col5:
+            e_coach = st.selectbox("Professor responsável", options=coach_opts,
+                                   index=0 if not row.get("coach_id") else (1 + [c["id"] for c in coaches].index(int(row["coach_id"])) ))
+        with col6:
+            e_slot = st.selectbox("Horário do treino", options=slot_opts,
+                                  index=0 if not row.get("train_slot_id") else (1 + [s["id"] for s in slots].index(int(row["train_slot_id"])) ))
+
+        col7, col8 = st.columns([2,2])
+        with col7:
+            cur_override = row.get("master_percent_override")
+            e_override = st.number_input(
+                "Repasse do aluno (%) (0 = usar padrão)",
+                min_value=0, max_value=100,
+                value=int(round(float(cur_override)*100)) if cur_override not in (None,"") else 0,
+                step=5
+            )
+        with col8:
+            e_active = st.checkbox("Ativo?", value=bool(row.get("active", True)))
+
+        save = st.form_submit_button("Salvar alterações", type="primary")
+
+    if save:
+        vals = {
+            "name": e_name.strip(),
+            "birth_date": e_birth,
+            "start_date": e_start,
+            "monthly_fee": float(e_fee or 0.0),
+            "active": bool(e_active),
+            "master_percent_override": (float(e_override)/100.0) if e_override>0 else None
+        }
+        if e_coach != coach_opts[0]:
+            vals["coach_id"] = next((c["id"] for c in coaches if c["name"]==e_coach), None)
+        else:
+            vals["coach_id"] = None
+        if e_slot != slot_opts[0]:
+            vals["train_slot_id"] = next((s["id"] for s in slots if s["name"]==e_slot), None)
+        else:
+            vals["train_slot_id"] = None
+
+        update_student_row(int(sid), vals)
+        st.success("Aluno atualizado.")
+        st.cache_data.clear()
+        st.rerun()
+
+def page_graduacoes(role: str):
+    st.markdown("### 🎖️ Graduações")
+    df = fetch_students_df()
+    if df.empty:
+        st.info("Cadastre alunos primeiro.")
+        return
+
+    sid = st.selectbox(
+        "Aluno", options=df["id"].tolist(),
+        format_func=lambda i: f"ID {i} — {df.loc[df['id']==i,'name'].values[0]}"
+    )
+
+    # Histórico
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(gh).where(gh.c.student_id==sid).order_by(gh.c.grade_date.desc())
+        ).mappings().all()
+    hist = pd.DataFrame([dict(r) for r in rows])
+    st.markdown("#### Histórico")
+    if hist.empty:
+        st.info("Sem graduações registradas.")
     else:
-        dfx = df_students.copy()
-        for c in ("birth_date","start_date"):
-            if c in dfx.columns: dfx[c] = dfx[c].apply(fmt_date)
-        show = [c for c in ["id","name","birth_date","start_date","monthly_fee","active","Graduação","Data Graduação","Idade","Tempo de treino"] if c in dfx.columns]
         st.dataframe(
-            dfx[show].rename(columns={
-                "id":"ID","name":"Nome","birth_date":"Nascimento","start_date":"Início","monthly_fee":"Mensalidade (R$)","active":"Ativo?"
-            }),
+            hist[["id","grade","grade_date","notes"]].rename(columns={
+                "id":"ID","grade":"Graduação","grade_date":"Data","notes":"Observações"
+            }).assign(Data=lambda d: d["Data"].map(fmt_date)).drop(columns=["grade_date"]),
             use_container_width=True, hide_index=True
         )
 
-    st.divider()
-    col1, col2 = st.columns([1,1])
-
-    # opções dropdown
-    coach_opts = [(None,"(Sem professor)")]
-    if not dfc.empty and "id" in dfc.columns and "name" in dfc.columns:
-        coach_opts += [(int(i), n) for i,n in zip(dfc["id"], dfc["name"])]
-    slot_opts = [(None,"(Sem horário)")]
-    if not dfs.empty and "id" in dfs.columns:
-        label_col = next((c for c in ["name","label","title","slot","descricao","hora","time"] if c in dfs.columns), None)
-        if label_col:
-            slot_opts += [(int(i), str(l)) for i,l in zip(dfs["id"], dfs[label_col])]
-        else:
-            slot_opts += [(int(i), f"ID {int(i)}") for i in dfs["id"]]
-
-    # CADASTRAR
-    with col1:
-        st.markdown("### ➕ Cadastrar novo aluno")
-        with st.form("form_new_student", clear_on_submit=False):
-            n_name  = st.text_input("Nome *")
-            n_birth = st.date_input("Data de nascimento", value=date(2000,1,1), min_value=BIRTH_MIN, max_value=BIRTH_MAX, format="DD/MM/YYYY")
-            n_start = st.date_input("Início do treino", value=date.today(), min_value=TRAIN_MIN, max_value=TRAIN_MAX, format="DD/MM/YYYY")
-            n_fee   = st.number_input("Mensalidade (R$)", min_value=0.0, step=10.0, format="%.2f")
-            n_active= st.checkbox("Ativo?", value=True)
-            n_override_pct = st.number_input("Repasse do aluno (%) (deixe 0 para usar padrão)", min_value=0, max_value=100, value=0, step=5)
-            n_coach = st.selectbox("Professor responsável", [o[0] for o in coach_opts], format_func=lambda v: dict(coach_opts)[v])
-            n_slot  = st.selectbox("Horário de treino", [o[0] for o in slot_opts], format_func=lambda v: dict(slot_opts)[v])
-            submit_new = st.form_submit_button("Salvar", type="primary", use_container_width=True)
-        if submit_new:
-            try:
-                payload = {
-                    "name": (n_name or "").strip(),
-                    "birth_date": n_birth,
-                    "start_date": n_start,
-                    "monthly_fee": float(n_fee or 0.0),
-                    "active": bool(n_active),
-                }
-                if n_coach is not None: payload["coach_id"] = int(n_coach)
-                if n_slot  is not None: payload["train_slot_id"] = int(n_slot)
-                if n_override_pct > 0: payload["master_percent_override"] = float(n_override_pct)/100.0
-
-                new_id = insert_row(T_STUDENT, payload) or 0
-                gp = build_grad_payload(new_id, "Branca", n_start, None)
-                if gp: insert_row(T_GRADUATION, gp)
-
-                flash("success", f"Aluno cadastrado (ID {new_id}).")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Erro ao cadastrar: {e}")
-
-    # EDITAR
-    with col2:
-        st.markdown("### ✏️ Editar aluno")
-        if df_students.empty:
-            st.info("Cadastre primeiro.")
-        else:
-            ids = df_students["id"].tolist()
-            sid = st.selectbox("Selecionar aluno (ID)", ids, format_func=lambda i: f"ID {i} — {df_students.loc[df_students['id']==i,'name'].values[0]}")
-            if sid:
-                row = df_students[df_students["id"]==sid].iloc[0]
-                with st.form(f"form_edit_{sid}"):
-                    c1, c2 = st.columns([2,1])
-                    with c1:
-                        e_name  = st.text_input("Nome *", value=str(row.get("name","")))
-                        e_birth = st.date_input("Data de nascimento", value=parse_date(row.get("birth_date")) or date(2000,1,1), min_value=BIRTH_MIN, max_value=BIRTH_MAX, format="DD/MM/YYYY")
-                        e_start = st.date_input("Início do treino", value=parse_date(row.get("start_date")) or date.today(), min_value=TRAIN_MIN, max_value=TRAIN_MAX, format="DD/MM/YYYY")
-                        e_active= st.checkbox("Ativo?", value=bool(row.get("active",True)))
-                        st.text_input("Graduação atual", value=str(row.get("Graduação","Branca")), disabled=True)
-                    with c2:
-                        e_fee = st.number_input("Mensalidade (R$)", value=float(row.get("monthly_fee",0.0) or 0.0), min_value=0.0, step=10.0, format="%.2f")
-
-                        val_override = row.get("master_percent_override")
-                        if val_override is None or (isinstance(val_override, float) and math.isnan(val_override)):
-                            cur_override_pct = 0
-                        else:
-                            try: cur_override_pct = int(round(float(val_override) * 100.0))
-                            except Exception: cur_override_pct = 0
-                        e_override = st.number_input("Repasse do aluno (%) (0 = usar padrão)", min_value=0, max_value=100, value=cur_override_pct, step=5)
-
-                        coach_ids = [o[0] for o in coach_opts]
-                        slot_ids  = [o[0] for o in slot_opts]
-                        def idx(lst, val): 
-                            try: return lst.index(val)
-                            except ValueError: return 0
-                        e_coach = st.selectbox("Professor responsável", coach_ids, index=idx(coach_ids, row.get("coach_id")), format_func=lambda v: dict(coach_opts)[v])
-                        e_slot  = st.selectbox("Horário de treino",   slot_ids,  index=idx(slot_ids,  row.get("train_slot_id")), format_func=lambda v: dict(slot_opts)[v])
-
-                    b_save = st.form_submit_button("Atualizar", type="primary")
-                    b_del  = st.form_submit_button("Excluir", type="secondary")
-
-                if b_save:
-                    try:
-                        pay = {
-                            "name": e_name.strip(),
-                            "birth_date": e_birth,
-                            "start_date": e_start,
-                            "monthly_fee": float(e_fee or 0.0),
-                            "active": bool(e_active),
-                        }
-                        if e_coach is not None: pay["coach_id"] = int(e_coach)
-                        if e_slot  is not None: pay["train_slot_id"] = int(e_slot)
-                        pay["master_percent_override"] = (float(e_override)/100.0) if e_override > 0 else None
-                        n = update_row(T_STUDENT, int(sid), pay)
-                        flash("success" if n else "info", "Aluno atualizado." if n else "Nada para atualizar.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Erro ao atualizar: {e}")
-
-                if b_del:
-                    try:
-                        n = delete_rows(T_STUDENT, [int(sid)])
-                        flash("success" if n else "warning", "Aluno excluído." if n else "Aluno não encontrado.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Erro ao excluir: {e}")
-
-# =========================================================
-# GRADUAÇÕES
-# =========================================================
-elif page == "Graduações":
-    require_admin()
-    st.subheader("Histórico de Graduações")
-    df_students = fetch_students_df()
-    if df_students.empty:
-        st.info("Cadastre alunos primeiro.")
-    else:
-        sid = st.selectbox("Aluno", df_students["id"].tolist(), format_func=lambda i: df_students.loc[df_students["id"]==i,"name"].values[0])
-        if sid:
-            st.markdown("#### Histórico")
-            gdf = fetch_grads_df(sid)
-            if not gdf.empty:
-                gdf2 = gdf.copy()
-                dcol = "date" if "date" in gdf2.columns else ("grade_date" if "grade_date" in gdf2.columns else ("created_at" if "created_at" in gdf2.columns else None))
-                gcol = "grade" if "grade" in gdf2.columns else ("graduation" if "graduation" in gdf2.columns else None)
-                if dcol: gdf2[dcol] = gdf2[dcol].apply(fmt_date)
-                show = [c for c in ["id", gcol, dcol, "notes","obs","observations"] if c and c in gdf2.columns]
-                ren = {}
-                if gcol: ren[gcol] = "Graduação"
-                if dcol: ren[dcol] = "Data"
-                if "notes" in show: ren["notes"]="Observações"
-                if "obs" in show: ren["obs"]="Observações"
-                if "observations" in show: ren["observations"]="Observações"
-                if "id" in show: ren["id"]="ID"
-                st.dataframe(gdf2[show].rename(columns=ren), use_container_width=True, hide_index=True)
-            else:
-                st.info("Sem lançamentos.")
-
-            st.divider()
-            st.markdown("#### Adicionar nova graduação")
-            with st.form("form_add_grad"):
-                gg = st.selectbox("Graduação", GRADE_CHOICES, index=0)
-                gd = st.date_input("Data da graduação", value=date.today(), min_value=TRAIN_MIN, max_value=TRAIN_MAX, format="DD/MM/YYYY")
-                gn = st.text_input("Observações (opcional)")
-                ok = st.form_submit_button("Adicionar", type="primary")
-            if ok:
-                try:
-                    payload = build_grad_payload(int(sid), gg, gd, (gn or None))
-                    if not payload:
-                        st.error("Tabela de graduações não possui colunas compatíveis.")
-                    else:
-                        nid = insert_row(T_GRADUATION, payload)
-                        if nid:
-                            flash("success", "Graduação registrada.")
-                        else:
-                            flash("warning", "Nada foi inserido (verifique as colunas da tabela).")
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"Erro ao inserir graduação: {e}")
-
-            if not gdf.empty and "id" in gdf.columns:
-                st.markdown("#### Excluir graduação")
-                gid = st.selectbox("Selecione uma entrada", gdf["id"].tolist())
-                if st.button("🗑️ Excluir graduação selecionada", type="secondary"):
-                    try:
-                        n = delete_rows(T_GRADUATION, [int(gid)])
-                        flash("success" if n else "warning", "Graduação excluída." if n else "Não encontrada.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Erro ao excluir: {e}")
-
-# =========================================================
-# RECEBER PAGAMENTO
-# =========================================================
-elif page == "Receber Pagamento":
-    require_admin()
-    st.subheader("Receber Pagamentos")
-
-    df_students = fetch_students_df()
-    if df_students.empty:
-        st.info("Cadastre alunos.")
-    else:
-        dfc = get_coaches_df()
-        coach_filter = None
-        if not dfc.empty and "id" in dfc.columns and "name" in dfc.columns and "coach_id" in df_students.columns:
-            opts = [{"id":None,"name":"(Todos)"}] + dfc[["id","name"]].to_dict("records")
-            lbl = {o["id"]: o["name"] for o in opts}
-            coach_filter = st.selectbox("Professor", [o["id"] for o in opts], format_func=lambda v: lbl[v])
-            dfl = df_students.copy()
-            if coach_filter is not None:
-                dfl = dfl[dfl["coach_id"]==coach_filter]
-        else:
-            dfl = df_students.copy()
-
-        st.markdown("#### Seleção de alunos para receber")
-        id_choices = dfl["id"].tolist() if "id" in dfl.columns else []
-        pick = st.multiselect("Alunos", id_choices, format_func=lambda i: f"ID {i} — {dfl.loc[dfl['id']==i,'name'].values[0]}")
-
-        with st.form("form_receive_pay"):
-            mref  = st.text_input("Mês de referência (AAAA-MM) (opcional)", value=datetime.today().strftime("%Y-%m"))
-            pdate = st.date_input("Data do pagamento", value=date.today(), min_value=TRAIN_MIN, max_value=date.today(), format="DD/MM/YYYY")
-            method= st.selectbox("Forma", ["Dinheiro","PIX","Cartão","Transferência"])
-            notes = st.text_input("Observações (opcional)")
-            ok    = st.form_submit_button("Confirmar recebimento", type="primary", use_container_width=True)
-
-        if ok:
-            try:
-                tbl_p = reflect_table(T_PAYMENT)
-                if tbl_p is None:
-                    st.error("Tabela de pagamentos não encontrada.")
-                else:
-                    okc = 0
-                    for sid in pick:
-                        row = dfl[dfl["id"]==sid].iloc[0].to_dict()
-                        amount = float(row.get("monthly_fee",0.0) or 0.0)
-                        master_amount, pct_used = compute_share_and_percent(row, amount)
-                        payload = {
-                            "student_id": int(sid),
-                            "amount": amount,
-                            "master_amount": master_amount,
-                            "paid_date": pdate,
-                            "method": method,
-                            "notes": (notes or None)
-                        }
-                        if has_col(tbl_p, "month_ref") and mref: payload["month_ref"] = mref
-                        if has_col(tbl_p, "master_percent_used"): payload["master_percent_used"] = pct_used
-                        if has_col(tbl_p, "master_adjustment"):    payload["master_adjustment"] = 0.0  # evita NOT NULL
-                        insert_row(T_PAYMENT, payload)
-                        okc += 1
-                    flash("success", f"{okc} pagamento(s) registrado(s).")
-                    st.rerun()
-            except Exception as e:
-                st.error(f"Erro ao receber pagamento: {e}")
-
-        st.divider()
-        st.markdown("#### Pagamentos do mês")
-        month_list = st.text_input("Filtrar mês (AAAA-MM)", value=datetime.today().strftime("%Y-%m"))
-        dpp = fetch_payments_df(month_list)
-        if not dpp.empty:
-            m = dpp.merge(df_students[["id","name"]], left_on="student_id", right_on="id", how="left", suffixes=("","_stu"))
-            m["name"] = m["name"].fillna("(Aluno removido)")
-            if "paid_date" in m.columns: m["paid_date"] = m["paid_date"].apply(fmt_date)
-            display_cols = [c for c in ["id","paid_date","name","amount","master_amount","method","notes"] if c in m.columns]
-            out = m[display_cols].rename(columns={"id":"ID","name":"Aluno","paid_date":"Data","amount":"Valor (R$)","master_amount":"Repasse (R$)"})
-            st.dataframe(out, use_container_width=True, hide_index=True)
-
-            if "ID" in out.columns:
-                del_ids = st.multiselect("Selecionar para excluir", out["ID"].tolist())
-                c1, c2 = st.columns([1,1])
-                with c1:
-                    if st.button("🗑️ Excluir selecionados", type="secondary", use_container_width=True):
-                        try:
-                            n = delete_rows(T_PAYMENT, [int(i) for i in del_ids])
-                            flash("success" if n else "info", f"{n} registro(s) removido(s)." if n else "Nada selecionado.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Erro ao excluir: {e}")
-                with c2:
-                    if st.button("🧹 Excluir TODOS deste mês", type="secondary", use_container_width=True):
-                        try:
-                            tbl_p = reflect_table(T_PAYMENT)
-                            if tbl_p is None:
-                                st.error("Tabela não encontrada.")
-                            else:
-                                if has_col(tbl_p, "month_ref") and month_list:
-                                    stmt = delete(tbl_p).where(tbl_p.c.month_ref == month_list)
-                                else:
-                                    if _dialect() == "postgresql":
-                                        stmt = delete(tbl_p).where(text("to_char(paid_date, 'YYYY-MM') = :m")).params(m=month_list)
-                                    else:  # sqlite
-                                        stmt = delete(tbl_p).where(text("strftime('%Y-%m', paid_date) = :m")).params(m=month_list)
-                                with engine.begin() as conn:
-                                    res = conn.execute(stmt)
-                                clear_data_cache()
-                                flash("success", f"{res.rowcount or 0} registro(s) removido(s).")
-                                st.rerun()
-                        except Exception as e:
-                            st.error(f"Erro ao excluir em massa: {e}")
-        else:
-            st.info("Sem pagamentos para o mês.")
-
-# =========================================================
-# EXTRAS
-# =========================================================
-elif page == "Extras (Repasse)":
-    require_admin()
-    st.subheader("Lançamentos Extras (positivos/negativos)")
-
-    df_students = fetch_students_df()
-    student_opts = [(None,"(Sem aluno vinculado)")]
-    if not df_students.empty:
-        student_opts += [(int(i), f"ID {int(i)} — {n}") for i,n in zip(df_students["id"], df_students["name"])]
-
-    with st.form("form_extra"):
-        edate = st.date_input("Data (DD/MM/AAAA)", value=date.today(), min_value=TRAIN_MIN, max_value=date.today(), format="DD/MM/YYYY")
-        mref  = st.text_input("Mês de referência (AAAA-MM)", value=datetime.today().strftime("%Y-%m"))
-        desc  = st.text_input("Descrição")
-        val   = st.number_input("Valor do extra (R$) — pode ser negativo", step=10.0, format="%.2f")
-        sid   = st.selectbox("Vincular a um aluno (opcional)", [o[0] for o in student_opts], format_func=lambda v: dict(student_opts)[v])
-        rec   = st.checkbox("Fixo mês a mês? (recorrente)", value=False)
-        ok    = st.form_submit_button("Adicionar extra", type="primary", use_container_width=True)
+    st.markdown("#### Adicionar graduação")
+    with st.form("form_add_grad"):
+        col1, col2 = st.columns([2,2])
+        with col1:
+            gg = st.selectbox("Graduação", options=GRADES, index=0)
+        with col2:
+            gd = st.date_input("Data da graduação", value=date.today())
+        notes = st.text_input("Observações (opcional)")
+        ok = st.form_submit_button("Salvar", type="primary")
 
     if ok:
-        try:
-            payload = {"description": desc, "amount": float(val or 0.0), "month_ref": mref, "created_at": edate}
-            if sid is not None: payload["student_id"] = int(sid)
-            tbl = reflect_table(T_EXTRA)
-            if has_col(tbl,"is_recurring"): payload["is_recurring"] = bool(rec)
-            nid = insert_row(T_EXTRA, payload)
-            if nid: flash("success", "Extra adicionado!")
-            else:   flash("warning", "Nada foi inserido (verifique as colunas).")
+        with engine.begin() as conn:
+            conn.execute(insert(gh).values(student_id=int(sid), grade=gg, grade_date=gd, notes=notes or None))
+        st.success("Graduação registrada.")
+        st.cache_data.clear()
+        st.rerun()
+
+def page_receber(role: str):
+    st.markdown("### 💵 Receber Pagamento")
+    df = fetch_students_df()
+    if df.empty:
+        st.info("Cadastre alunos primeiro.")
+        return
+
+    # Filtro por professor
+    profs = ["(todos)"] + sorted([p for p in df["coach"].dropna().unique()])
+    coach_sel = st.selectbox("Filtrar por professor", profs)
+
+    df_active = df[df["active"]==True].copy()
+    if coach_sel != "(todos)":
+        df_active = df_active[df_active["coach"]==coach_sel]
+
+    st.markdown("#### Confirmar pagamento de vários alunos")
+    with st.form("form_receive_many"):
+        c1, c2, c3 = st.columns([3,2,2])
+        with c1:
+            ids = st.multiselect("Selecione os alunos", options=df_active["id"].tolist(),
+                                 format_func=lambda i: f"ID {i} — {df_active.loc[df_active['id']==i,'name'].values[0]}")
+        with c2:
+            paid_dt = st.date_input("Data do pagamento", value=date.today())
+        with c3:
+            method = st.selectbox("Forma", ["Dinheiro","PIX","Cartão","Transferência"])
+        notes = st.text_input("Observações (opcional)")
+        ok = st.form_submit_button("Registrar", type="primary")
+
+    if ok:
+        if not ids:
+            st.warning("Selecione ao menos um aluno.")
+        else:
+            cnt = 0
+            for sid in ids:
+                fee = float(df_active.loc[df_active["id"]==sid,"monthly_fee"].values[0] or 0.0)
+                record_payment(int(sid), paid_dt, fee, method, notes or None)
+                cnt += 1
+            st.success(f"Pagamentos registrados para {cnt} aluno(s).")
+            st.cache_data.clear()
             st.rerun()
-        except Exception as e:
-            st.error(f"Erro ao adicionar extra: {e}")
+
+    st.divider()
+    st.markdown("#### Pagamentos do mês e exclusão")
+    month = st.text_input("Mês (AAAA-MM)", value=month_of(date.today()))
+    # Mostrar tabela de pagos no mês
+    with engine.begin() as conn:
+        rows = conn.execute(select(pay).where(pay.c.month_ref==month).order_by(pay.c.paid_date.desc())).mappings().all()
+    dfp = pd.DataFrame([dict(r) for r in rows])
+    if dfp.empty:
+        st.info("Sem pagamentos nesse mês.")
+        return
+
+    # Juntar com nomes
+    df_name = fetch_students_df()[["id","name"]].rename(columns={"id":"student_id"})
+    dft = dfp.merge(df_name, on="student_id", how="left")
+    dft["paid_date_fmt"] = dft["paid_date"].map(fmt_date)
+    dft["amount_fmt"]    = dft["amount"].map(fmt_currency)
+    dft["repasse_fmt"]   = dft["master_amount"].map(fmt_currency)
+    dft["percent_fmt"]   = (dft["master_percent_used"].astype(float)*100.0).round(0).astype(int).astype(str) + "%"
+
+    st.dataframe(
+        dft[["id","name","paid_date_fmt","amount_fmt","percent_fmt","repasse_fmt","method","notes"]]
+         .rename(columns={"id":"ID","name":"Aluno","paid_date_fmt":"Data","amount_fmt":"Valor","percent_fmt":"% repasse","repasse_fmt":"Repasse (R$)","method":"Forma","notes":"Obs"}),
+        use_container_width=True, hide_index=True
+    )
+
+    with st.form("form_delete_pay"):
+        ids_to_delete = st.multiselect("Selecionar pagamentos para excluir",
+                                       options=dft["id"].tolist(),
+                                       format_func=lambda i: f"ID {i} — {dft.loc[dft['id']==i,'name'].values[0]} ({dft.loc[dft['id']==i,'paid_date_fmt'].values[0]})")
+        c1, c2 = st.columns([1,1])
+        with c1:
+            btn = st.form_submit_button("Excluir selecionados", type="secondary")
+        with c2:
+            allm = st.form_submit_button(f"Excluir todos de {month}", type="secondary")
+
+    if btn and ids_to_delete:
+        n = delete_payments([int(i) for i in ids_to_delete])
+        st.success(f"{n} pagamento(s) excluído(s).")
+        st.rerun()
+
+    if allm:
+        n = delete_payments(dft["id"].tolist())
+        st.success(f"Todos os pagamentos de {month} foram excluídos ({n} registro(s)).")
+        st.rerun()
+
+def page_extras(role: str):
+    st.markdown("### ➕ Extras (Repasse)")
+    df = fetch_students_df()
+    students_opts = ["(Sem aluno vinculado)"] + [f"ID {i} — {n}" for i, n in df[["id","name"]].values.tolist()]
+
+    with st.form("form_extra"):
+        col1, col2, col3 = st.columns([2,2,2])
+        with col1:
+            dt = st.date_input("Data do lançamento", value=date.today())
+        with col2:
+            month = st.text_input("Mês de referência (AAAA-MM)", value=month_of(date.today()))
+        with col3:
+            val = st.number_input("Valor do extra (R$) (pode ser negativo)", value=0.0, step=10.0, format="%.2f")
+        desc = st.text_input("Descrição")
+        rec  = st.radio("Recorrente?", ["Não","Sim"], horizontal=True)
+        vinc = st.selectbox("Vincular a um aluno (opcional)", options=students_opts)
+        ok   = st.form_submit_button("Salvar", type="primary")
+
+    if ok:
+        sid = None
+        if vinc != students_opts[0]:
+            sid = int(vinc.split(" ")[1])
+        with engine.begin() as conn:
+            conn.execute(insert(extra).values(
+                student_id=sid,
+                description=desc.strip() if desc else "Outros",
+                amount=float(val),
+                month_ref=month,
+                is_recurring=(rec=="Sim"),
+                created_at=dt
+            ))
+        st.success("Extra registrado.")
+        st.rerun()
 
     st.divider()
     st.markdown("#### Lista de extras por mês")
-    month_list = st.text_input("Mês (AAAA-MM)", value=datetime.today().strftime("%Y-%m"))
-    dfe = fetch_extras_df(month_list)
+    filtro = st.text_input("Mês (AAAA-MM)", value=month_of(date.today()))
+    with engine.begin() as conn:
+        rows = conn.execute(select(extra).where(
+            or_(
+                extra.c.month_ref==filtro,
+                and_(extra.c.is_recurring==True, extra.c.created_at <= text(f"DATE '{filtro}-01'") + text(" + INTERVAL '1 month' - INTERVAL '1 day'"))
+            )
+        ).order_by(extra.c.id)).mappings().all()
+    dfe = pd.DataFrame([dict(r) for r in rows])
     if dfe.empty:
-        st.info("Sem extras.")
+        st.info("Sem extras para o mês.")
     else:
-        if "student_id" in dfe.columns and not df_students.empty:
-            dfe = dfe.merge(df_students[["id","name"]], left_on="student_id", right_on="id", how="left")
-            dfe["Aluno"] = dfe["name"].fillna("Outros")
-        else:
-            dfe["Aluno"] = "Outros"
-        view = []
-        if "id" in dfe.columns: view.append("id")
-        if "created_at" in dfe.columns: dfe["created_at"] = dfe["created_at"].apply(fmt_date); view.append("created_at")
-        view += [c for c in ["Aluno","description","amount","is_recurring"] if c in dfe.columns]
-        out = dfe[view].rename(columns={"id":"ID","created_at":"Data","description":"Descrição","amount":"Valor (R$)","is_recurring":"Recorrente?"})
-        st.dataframe(out, use_container_width=True, hide_index=True)
+        name_map = dict(df[["id","name"]].values.tolist())
+        dfe["Aluno"] = dfe["student_id"].map(lambda x: name_map.get(int(x)) if pd.notna(x) else "Outros")
+        dfe["Data"]  = dfe["created_at"].map(fmt_date)
+        dfe["Valor (R$)"] = dfe["amount"].map(fmt_currency)
+        dfe["Recorrente?"] = dfe["is_recurring"].map(lambda v: "Sim" if v else "Não")
+        st.dataframe(dfe[["id","Data","Aluno","description","Valor (R$)","Recorrente?"]]
+                     .rename(columns={"id":"ID","description":"Descrição"}),
+                     use_container_width=True, hide_index=True)
 
-        if "ID" in out.columns:
-            del_ids = st.multiselect("Selecionar extras para excluir", out["ID"].tolist())
-            if st.button("🗑️ Excluir extras selecionados", type="secondary"):
-                try:
-                    n = delete_rows(T_EXTRA, [int(i) for i in del_ids])
-                    flash("success" if n else "info", f"{n} removido(s)." if n else "Nada selecionado.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Erro ao excluir: {e}")
+def page_relatorios(role: str):
+    st.markdown("### 📊 Relatórios")
+    df = fetch_students_df()
+    if df.empty:
+        st.info("Cadastre alunos primeiro.")
+        return
 
-# =========================================================
-# RELATÓRIOS
-# =========================================================
-elif page == "Relatórios":
-    st.subheader("Relatório de repasse (mensalidades + extras)")
-    month = st.text_input("Mês de referência (AAAA-MM)", value=datetime.today().strftime("%Y-%m"))
+    c1, c2 = st.columns([2,2])
+    with c1:
+        month = st.text_input("Mês (AAAA-MM)", value=month_of(date.today()))
+    with c2:
+        profs = ["(todos)"] + sorted([p for p in df["coach"].dropna().unique()])
+        coach_sel = st.selectbox("Filtrar por professor", profs)
 
-    df_students = fetch_students_df()
-    dpp = fetch_payments_df(month)
-    dfe = fetch_extras_df(month)
+    # Pagamentos
+    with engine.begin() as conn:
+        pagos = conn.execute(select(pay).where(pay.c.month_ref==month)).mappings().all()
+        rows_e = conn.execute(select(extra)).mappings().all()
 
-    dfc = get_coaches_df()
-    coach_filter = None
-    if not dfc.empty and "id" in dfc.columns and "name" in dfc.columns and "coach_id" in df_students.columns:
-        opts = [{"id":None,"name":"(Todos)"}] + dfc[["id","name"]].to_dict("records")
-        lbl = {o["id"]: o["name"] for o in opts}
-        coach_filter = st.selectbox("Professor", [o["id"] for o in opts], format_func=lambda v: lbl[v])
+    dpp = pd.DataFrame([dict(r) for r in pagos])
+    dpp = dpp.merge(df[["id","name","birth_date","start_date","grade","coach"]].rename(columns={"id":"student_id"}),
+                    on="student_id", how="left")
 
-    st.markdown("### 📒 Mensalidades (alunos)")
-    if dpp.empty:
-        st.info("Sem pagamentos no mês."); pag = pd.DataFrame()
+    if coach_sel != "(todos)":
+        dpp = dpp[dpp["coach"]==coach_sel]
+
+    if not dpp.empty:
+        dpp["Idade"] = dpp["birth_date"].map(lambda d: idade_anos(parse_date(d)))
+        dpp["Tempo de treino"] = dpp["start_date"].map(lambda d: tempo_treino(parse_date(d)))
+        dpp["Graduação"] = dpp["grade"]
+        dpp["Data"] = dpp["paid_date"].map(fmt_date)
+        dpp["Valor (R$)"] = dpp["amount"].map(fmt_currency)
+        dpp["Repasse (%)"] = (dpp["master_percent_used"].astype(float)*100.0).round(0).astype(int).astype(str) + "%"
+        dpp["Repasse (R$)"] = dpp["master_amount"].map(fmt_currency)
+
+        st.markdown("#### Relatório de repasse de mensalidades")
+        st.dataframe(dpp[["student_id","name","Idade","Tempo de treino","Graduação","Data","method","Valor (R$)","Repasse (%)","Repasse (R$)"]]
+                     .rename(columns={"student_id":"ID","name":"Aluno","method":"Forma"}),
+                     use_container_width=True, hide_index=True)
     else:
-        pag = dpp.merge(df_students, left_on="student_id", right_on="id", how="left", suffixes=("","_s"))
-        if coach_filter is not None and "coach_id" in pag.columns: pag = pag[pag["coach_id"] == coach_filter]
-        if not pag.empty and "paid_date" in pag.columns: pag["paid_date"] = pag["paid_date"].apply(fmt_date)
-        cols = [c for c in ["id","paid_date","name","Idade","Tempo de treino","Graduação","amount","master_amount","method","notes"] if c in pag.columns]
-        pag = pag[cols].rename(columns={"id":"ID","name":"Aluno","paid_date":"Data","amount":"Valor (R$)","master_amount":"Repasse (R$)"})
-        st.dataframe(pag, use_container_width=True, hide_index=True)
+        st.info("Sem pagamentos nesse mês com o filtro selecionado.")
 
-    total_pag = float(pag["Valor (R$)"].sum() if "Valor (R$)" in pag.columns else 0.0)
+    total_repasse_pag = float(dpp["master_amount"].astype(float).sum()) if not dpp.empty else 0.0
 
-    st.markdown("### ➕ Relatório de extras (detalhado)")
-    if dfe.empty:
-        st.info("Sem extras no mês (recorrentes também aparecem)."); ext = pd.DataFrame()
+    # Extras (detalhado)
+    dfe = pd.DataFrame([dict(r) for r in rows_e])
+    if not dfe.empty:
+        df_names = df[["id","name","coach"]].rename(columns={"id":"student_id"})
+        dfe = dfe.merge(df_names, on="student_id", how="left")
+        if coach_sel != "(todos)":
+            # incluir extras sem aluno (Outros) + extras de alunos do professor
+            dfe = dfe[(dfe["name"].isna()) | (dfe["coach"]==coach_sel)]
+
+        # Recorrentes: entram em qualquer mês a partir da created_at; pontuais: exatamente no month_ref
+        month_first = datetime.strptime(month+"-01", "%Y-%m-%d").date()
+        dfe = dfe[( (dfe["is_recurring"]==True) & (dfe["created_at"]<=month_first) ) | (dfe["month_ref"]==month)]
+        dfe["Aluno"] = dfe.apply(lambda r: ("Outros" if pd.isna(r.get("name")) else r.get("name")), axis=1)
+        dfe["Data"]  = dfe["created_at"].map(fmt_date)
+        dfe["Valor (R$)"] = dfe["amount"].map(fmt_currency)
+        dfe["Recorrente?"] = dfe["is_recurring"].map(lambda v: "Sim" if v else "Não")
+
+        st.markdown("#### Relatório de extras (detalhado)")
+        st.dataframe(dfe[["id","Data","Aluno","description","Valor (R$)","Recorrente?"]]
+                     .rename(columns={"id":"ID","description":"Descrição"}),
+                     use_container_width=True, hide_index=True)
+        total_extras = float(dfe["amount"].astype(float).sum())
     else:
-        if "student_id" in dfe.columns:
-            ext = dfe.merge(df_students[["id","name"]], left_on="student_id", right_on="id", how="left")
-            ext["Aluno"] = ext["name"].fillna("Outros")
-        else:
-            ext = dfe.copy(); ext["Aluno"] = "Outros"
-        if "created_at" in ext.columns: ext["created_at"] = ext["created_at"].apply(fmt_date)
-        cols = [c for c in ["id","created_at","Aluno","description","amount","is_recurring"] if c in ext.columns]
-        ext = ext[cols].rename(columns={"id":"ID","created_at":"Data","description":"Descrição","amount":"Valor (R$)","is_recorrente?":"Recorrente?"})
-        # correção do nome da coluna
-        if "Recorrente?" not in ext.columns and "is_recurring" in cols:
-            ext.rename(columns={"is_recurring":"Recorrente?"}, inplace=True)
-        st.dataframe(ext, use_container_width=True, hide_index=True)
-
-    total_ext = float(ext["Valor (R$)"].sum() if not ext.empty and "Valor (R$)" in ext.columns else 0.0)
+        st.info("Sem extras cadastrados.")
+        total_extras = 0.0
 
     st.divider()
     c1, c2, c3 = st.columns(3)
-    c1.metric("Mensalidades (bruto)", money(total_pag))
-    c2.metric("Extras", money(total_ext))
-    c3.metric("Total geral", money(total_pag + total_ext))
+    with c1:
+        st.metric("Repasse sobre mensalidades", fmt_currency(total_repasse_pag))
+    with c2:
+        st.metric("Extras (repasse)", fmt_currency(total_extras))
+    with c3:
+        st.metric("Total geral", fmt_currency(total_repasse_pag + total_extras))
 
-    st.markdown("#### Exportar CSV")
-    if not pag.empty:
-        out_csv_pag = pag.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ Exportar mensalidades", out_csv_pag, file_name=f"mensalidades_{month}.csv", mime="text/csv")
-    if not ext.empty:
-        out_csv_ext = ext.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ Exportar extras", out_csv_ext, file_name=f"extras_{month}.csv", mime="text/csv")
+def page_config(role: str):
+    if role != "admin":
+        st.info("Acesso restrito ao administrador.")
+        return
 
-# =========================================================
-# IMPORT / EXPORT
-# =========================================================
-elif page == "Importar / Exportar":
-    require_admin()
-    st.subheader("Importar / Exportar")
+    st.markdown("### ⚙️ Configurações")
+    cfg = ensure_settings()
+    curr_pct = int(round(float(cfg.get("master_percent", 0.60))*100))
 
-    st.markdown("### Exportar")
-    df_students = fetch_students_df()
-    if not df_students.empty:
-        out = df_students.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ Alunos (CSV)", out, file_name="alunos.csv", mime="text/csv")
+    with st.form("form_cfg"):
+        pct = st.number_input("Percentual padrão de repasse (%)", min_value=0, max_value=100, step=5, value=curr_pct)
+        ok  = st.form_submit_button("Salvar", type="primary")
 
-    dpp = fetch_payments_df()
-    if not dpp.empty:
-        out = dpp.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ Pagamentos (CSV)", out, file_name="pagamentos.csv", mime="text/csv")
-
-    dfe = fetch_extras_df()
-    if not dfe.empty:
-        out = dfe.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ Extras (CSV)", out, file_name="extras.csv", mime="text/csv")
+    if ok:
+        with engine.begin() as conn:
+            conn.execute(update(settings).where(settings.c.id==cfg["id"]).values(master_percent=float(pct)/100.0))
+        st.success("Configurações salvas.")
+        st.rerun()
 
     st.divider()
-    st.markdown("### Importar (alunos) — CSV com colunas compatíveis")
-    up = st.file_uploader("Arquivo CSV", type=["csv"])
-    if up is not None:
-        try:
-            df = pd.read_csv(up)
-            if df.empty: st.warning("CSV vazio.")
-            else:
-                count = 0
-                for _, r in df.iterrows():
-                    payload = {k: r[k] for k in r.index}
-                    if "birth_date" in payload: payload["birth_date"] = parse_date(payload["birth_date"])
-                    if "start_date" in payload: payload["start_date"] = parse_date(payload["start_date"])
-                    if "monthly_fee" in payload:
-                        try: payload["monthly_fee"] = float(payload["monthly_fee"])
-                        except: payload["monthly_fee"] = 0.0
-                    nid = insert_row(T_STUDENT, payload); 
-                    if nid: count += 1
-                flash("success", f"{count} aluno(s) importado(s).")
-                st.rerun()
-        except Exception as e:
-            st.error(f"Erro ao importar: {e}")
+    st.markdown("#### Cadastros auxiliares")
+    st.caption("Professores e horários utilizados no cadastro de alunos")
+    tab1, tab2 = st.tabs(["👨‍🏫 Professores", "🕒 Horários"])
 
-# =========================================================
-# CONFIGURAÇÕES
-# =========================================================
-elif page == "Configurações":
-    require_admin()
-    st.subheader("Configurações")
-
-    # Settings
-    tbl = reflect_table(T_SETTINGS)
-    if tbl is None:
-        st.info("Tabela de configurações não encontrada.")
-    else:
-        with engine.begin() as conn: row = conn.execute(select(tbl)).mappings().first()
-        st.markdown("#### Parâmetros gerais")
-        with st.form("form_settings"):
-            sid = row.get("id") if row else None
-            master_current = float(row.get("master_percent", 0.0) or 0.0) if row else 0.0
-            master_percent = st.number_input("Percentual padrão de repasse (0.00 = 0%, 0.50 = 50%, 1.00 = 100%)", value=master_current, min_value=0.0, max_value=1.0, step=0.05, format="%.2f")
-            save = st.form_submit_button("Salvar", type="primary")
-        if save:
-            try:
-                if sid: update_row(T_SETTINGS, int(sid), {"master_percent": float(master_percent)})
-                else:   insert_row(T_SETTINGS, {"master_percent": float(master_percent)})
-                flash("success", "Configurações salvas.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Erro ao salvar configurações: {e}")
-
-    st.divider()
-    # Professores
-    st.markdown("#### Professores")
-    dfc = get_coaches_df()
-    if dfc.empty:
-        st.info("Tabela de professores não encontrada ou vazia.")
-    else:
-        show = [c for c in ["id","name","full_pass"] if c in dfc.columns]
-        st.dataframe(dfc[show], use_container_width=True, hide_index=True)
-        with st.form("form_coach_new"):
-            nc = st.text_input("Nome do professor")
-            fp = st.checkbox("Repasse completo (100%)?", value=False)
-            ok = st.form_submit_button("Adicionar professor", type="primary")
+    with tab1:
+        with st.form("form_coach"):
+            name = st.text_input("Nome do professor")
+            full = st.checkbox("Repasse completo (100%)", value=False)
+            ok = st.form_submit_button("Adicionar", type="primary")
         if ok:
-            try:
-                nid = insert_row(T_COACH, {"name": nc, "full_pass": bool(fp)})
-                if nid: flash("success", "Professor adicionado.")
-                else:   flash("warning", "Nada inserido (verifique colunas).")
+            if not name.strip():
+                st.error("Informe o nome.")
+            else:
+                with engine.begin() as conn:
+                    conn.execute(insert(coach).values(name=name.strip(), full_pass=bool(full)))
+                st.success("Professor cadastrado.")
                 st.rerun()
-            except Exception as e:
-                st.error(f"Erro ao adicionar professor: {e}")
+
+        lst = list_coaches()
+        if lst:
+            dfc = pd.DataFrame(lst)
+            dfc["full_pass"] = dfc["full_pass"].map(lambda v: "Sim" if v else "Não")
+            st.dataframe(dfc.rename(columns={"id":"ID","name":"Nome","full_pass":"Repasse completo?"}),
+                         use_container_width=True, hide_index=True)
+
+    with tab2:
+        with st.form("form_slot"):
+            sname = st.text_input("Nome/descrição do horário (ex.: Seg/Qua 19h)")
+            ok2 = st.form_submit_button("Adicionar", type="primary")
+        if ok2:
+            if not sname.strip():
+                st.error("Informe o nome/descrição.")
+            else:
+                with engine.begin() as conn:
+                    conn.execute(insert(slot).values(name=sname.strip()))
+                st.success("Horário cadastrado.")
+                st.rerun()
+
+        lsts = list_slots()
+        if lsts:
+            dfs = pd.DataFrame(lsts)
+            st.dataframe(dfs.rename(columns={"id":"ID","name":"Horário"}), use_container_width=True, hide_index=True)
+
+# -----------------------------------------------------------------------------
+# App
+# -----------------------------------------------------------------------------
+
+def main():
+    role = check_login()
+    header()
+
+    pages_admin = {
+        "Alunos": page_alunos,
+        "Graduações": page_graduacoes,
+        "Receber Pagamento": page_receber,
+        "Extras (Repasse)": page_extras,
+        "Relatórios": page_relatorios,
+        "Configurações": page_config,
+    }
+    pages_oper = {
+        "Alunos": page_alunos,
+        "Receber Pagamento": page_receber,
+        "Relatórios": page_relatorios,
+    }
+
+    menu = pages_admin if role=="admin" else pages_oper
+
+    with st.sidebar:
+        st.markdown("### Navegação")
+        page = st.radio("Ir para:", list(menu.keys()))
+        st.divider()
+        if st.button("Sair"):
+            st.session_state.pop("role", None)
+            st.rerun()
+
+    # Render
+    menu[page](role)
+
+if __name__ == "__main__":
+    main()
