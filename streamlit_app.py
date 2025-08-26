@@ -156,8 +156,11 @@ extra_repasse = Table(
     Column("amount", Numeric(12,2), nullable=False),  # pode ser negativo
     Column("is_recurring", Boolean, nullable=False, server_default="false"),
     Column("student_id", Integer, ForeignKey("student.id"), nullable=True),
-    # coach_id será adicionado por migração automática (abaixo)
+    Column("coach_id", Integer, ForeignKey("coach.id"), nullable=True),  # <<< ADICIONADA AQUI
     Column("created_at", Date, nullable=False, server_default=func.current_date()),
+)
+Index("ix_extra_repasse_month_ref", extra_repasse.c.month_ref)
+Index("ix_extra_repasse_student_id", extra_repasse.c.student_id)
 )
 Index("ix_extra_repasse_month_ref", extra_repasse.c.month_ref)
 Index("ix_extra_repasse_student_id", extra_repasse.c.student_id)
