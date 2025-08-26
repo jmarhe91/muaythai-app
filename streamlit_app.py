@@ -161,9 +161,7 @@ extra_repasse = Table(
 )
 Index("ix_extra_repasse_month_ref", extra_repasse.c.month_ref)
 Index("ix_extra_repasse_student_id", extra_repasse.c.student_id)
-)
-Index("ix_extra_repasse_month_ref", extra_repasse.c.month_ref)
-Index("ix_extra_repasse_student_id", extra_repasse.c.student_id)
+
 
 BELTS = [
     "Branca","Amarelo","Amarelo e Branca","Verde","Verde e Branca",
