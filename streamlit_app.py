@@ -12,7 +12,8 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, String, Date, Boolean, Text,
-    Numeric, ForeignKey, select, insert, update, delete, func, Index, inspect, text
+    Numeric, ForeignKey, select, insert, update, delete, func, Index, inspect, text,
+    or_, and_,
 )
 from sqlalchemy.engine import Engine, Connection
 from sqlalchemy.exc import SQLAlchemyError, ProgrammingError
@@ -58,13 +59,16 @@ def require_login() -> str:
 
 # -------------------- Datas ------------------------
 TODAY = date.today()
-BIRTH_MIN, BIRTH_MAX = date(1930,1,1), TODAY
-START_MIN, START_MAX = date(2000,1,1), TODAY
-GRADE_MIN, GRADE_MAX = START_MIN, TODAY
+# faixas amplas para evitar erros de range
+BIRTH_MIN, BIRTH_MAX = date(1930,1,1), date(2100,12,31)
+START_MIN, START_MAX = date(2000,1,1), date(2100,12,31)
+GRADE_MIN, GRADE_MAX = START_MIN, date(2100,12,31)
 
 def first_day_same_month_years_ago(d: date, years: int) -> date:
-    return date(d.year - years, d.month, 1)
-PAY_MIN, PAY_MAX = first_day_same_month_years_ago(TODAY, 1), TODAY + timedelta(days=1)
+    y = max(1900, d.year - years)
+    return date(y, d.month, 1)
+
+PAY_MIN, PAY_MAX = first_day_same_month_years_ago(TODAY, 50), date(2100,12,31)
 
 def clamp_date(d: Optional[date], min_d: date, max_d: date) -> date:
     if d is None: return min_d
@@ -156,12 +160,12 @@ extra_repasse = Table(
     Column("amount", Numeric(12,2), nullable=False),  # pode ser negativo
     Column("is_recurring", Boolean, nullable=False, server_default="false"),
     Column("student_id", Integer, ForeignKey("student.id"), nullable=True),
-    Column("coach_id", Integer, ForeignKey("coach.id"), nullable=True),  # <<< ADICIONADA AQUI
+    Column("coach_id", Integer, ForeignKey("coach.id"), nullable=True),  # alinhar modelo ao banco
     Column("created_at", Date, nullable=False, server_default=func.current_date()),
 )
 Index("ix_extra_repasse_month_ref", extra_repasse.c.month_ref)
 Index("ix_extra_repasse_student_id", extra_repasse.c.student_id)
-
+# índice de coach_id criado de forma idempotente por migração (abaixo)
 
 BELTS = [
     "Branca","Amarelo","Amarelo e Branca","Verde","Verde e Branca",
@@ -186,18 +190,20 @@ def bootstrap_db_if_needed() -> None:
         pass
 
 def ensure_extra_has_coach():
-    """Cria coluna coach_id em extra_repasse se não existir, e índice seguro."""
+    """Cria coluna coach_id em extra_repasse e índice, se não existirem (idempotente)."""
     try:
         insp = inspect(engine)
         cols = [c["name"] for c in insp.get_columns("extra_repasse")]
         if "coach_id" not in cols:
             with engine.begin() as conn:
-                # Postgres & SQLite aceitam ADD COLUMN simples
                 conn.execute(text("ALTER TABLE extra_repasse ADD COLUMN coach_id INTEGER NULL"))
-                # índice seguro
+        # índice (Postgres aceita IF NOT EXISTS; SQLite ignora nome repetido)
+        with engine.begin() as conn:
+            try:
                 conn.execute(text("CREATE INDEX IF NOT EXISTS ix_extra_repasse_coach_id ON extra_repasse (coach_id)"))
+            except Exception:
+                pass
     except Exception:
-        # Não falha o app por causa da migração
         pass
 
 bootstrap_db_if_needed()
@@ -345,6 +351,7 @@ def page_alunos(role: str):
                             master_percent_override=pct_ui_to_decimal(n_override_pct) if n_override_pct else None,
                         ))
                         stu_id = res.inserted_primary_key[0]
+                        # graduação inicial: Branca com data de início do treino
                         conn.execute(insert(graduation).values(student_id=stu_id, grade="Branca", grade_date=(n_start or TODAY)))
                         conn.execute(update(student).where(student.c.id==stu_id).values(grade="Branca", grade_date=(n_start or TODAY)))
                     invalidate_all_cache()
@@ -481,7 +488,7 @@ def page_graduacoes(role: str):
         except SQLAlchemyError as e:
             st.error(f"Erro ao salvar graduação: {e}")
 
-    # Excluir (NOVO)
+    # Excluir
     st.subheader("Excluir graduação")
     if hist.empty:
         st.caption("Nada para excluir.")
@@ -612,7 +619,7 @@ def page_receber(role: str):
                 .rename(columns={"aluno":"Aluno","month_ref":"Ref.","method":"Forma","notes":"Obs."})
         st.dataframe(show, use_container_width=True, hide_index=True)
 
-        # Exclusão mostrando nomes (NOVIDADE)
+        # Exclusão mostrando nomes
         def label_pag_id(pid: int) -> str:
             r = dfp.loc[dfp["id"]==pid].iloc[0]
             return f"{r['aluno']} — {r['Data']} — {fmt_money(r['amount'])}"
@@ -641,7 +648,6 @@ def page_extras(role: str):
     st.header("Extras (Repasse)")
     df_stu = fetch_students_df()
     coaches = fetch_coaches()
-    coach_map = {c["id"]: c["name"] for c in coaches}
 
     with st.form("form_extra"):
         col1,col2,col3 = st.columns([1,1,2])
@@ -658,9 +664,9 @@ def page_extras(role: str):
         with col5:
             is_rec = st.checkbox("Recorrente mês a mês?", value=False)
         with col6:
-            opt_stu = ["(sem aluno)"] + [f"{n} (ID {int(i)})" for i,n in zip(df_stu["id"], df_stu["name"])] if not df_stu.empty else ["(sem aluno)"]
-            pick_stu = st.selectbox("Vincular a um aluno (opcional)", opt_stu)
-        # NOVO: professor
+            opt_stu = ["(sem aluno)"] + [f"{n}" for n in df_stu["name"]] if not df_stu.empty else ["(sem aluno)"]
+            pick_stu_name = st.selectbox("Vincular a um aluno (opcional)", opt_stu)
+
         col7, = st.columns(1)
         with col7:
             opt_coach = ["(sem professor)"] + [c["name"] for c in coaches]
@@ -672,8 +678,11 @@ def page_extras(role: str):
         try:
             with engine.begin() as conn:
                 sid = None
-                if pick_stu != "(sem aluno)":
-                    sid = int(pick_stu.split("ID")[-1].strip(" )"))
+                if pick_stu_name != "(sem aluno)" and not df_stu.empty:
+                    # localizar ID pelo nome
+                    m = df_stu[df_stu["name"]==pick_stu_name]
+                    if not m.empty:
+                        sid = int(m.iloc[0]["id"])
                 # Se professor não selecionado, herda do aluno (se houver)
                 coach_id = None
                 if pick_coach_name != "(sem professor)":
@@ -683,9 +692,7 @@ def page_extras(role: str):
                     r = conn.execute(select(student.c.coach_id).where(student.c.id==sid)).first()
                     coach_id = r[0] if r and r[0] is not None else None
 
-                # garante coluna coach_id
                 ensure_extra_has_coach()
-
                 conn.execute(insert(extra_repasse).values(
                     date=dt, month_ref=month_ref, description=desc.strip(),
                     amount=float(val), is_recurring=bool(is_rec), student_id=sid, coach_id=coach_id
@@ -696,27 +703,59 @@ def page_extras(role: str):
 
     st.subheader("Lista de extras por mês")
     m = st.text_input("Mês (AAAA-MM)", value=this_month_ref(), key="list_extra_month")
+    # filtro professor na listagem também (opcional)
+    filtro_coach = st.selectbox("Filtrar por professor", ["(todos)"] + [c["name"] for c in coaches], key="extra_filter_coach")
     with engine.begin() as conn:
-        rows = conn.execute(select(extra_repasse).where(extra_repasse.c.month_ref==m)
-                            .order_by(extra_repasse.c.date.desc(), extra_repasse.c.id.desc())).mappings().all()
-    dfe = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[c.name for c in extra_repasse.c])
+        # join para mostrar nomes de aluno e professor
+        q_ext = (
+            select(
+                extra_repasse.c.id,
+                extra_repasse.c.date,
+                extra_repasse.c.month_ref,
+                extra_repasse.c.description,
+                extra_repasse.c.amount,
+                extra_repasse.c.is_recurring,
+                extra_repasse.c.student_id,
+                extra_repasse.c.coach_id,
+                student.c.name.label("aluno"),
+                coach.c.name.label("professor_name"),
+            )
+            .select_from(
+                extra_repasse
+                .outerjoin(student, extra_repasse.c.student_id == student.c.id)
+                .outerjoin(coach, extra_repasse.c.coach_id == coach.c.id)
+            )
+            .where(extra_repasse.c.month_ref == m)
+            .order_by(extra_repasse.c.date.desc(), extra_repasse.c.id.desc())
+        )
+        if filtro_coach != "(todos)":
+            cid = next((c["id"] for c in coaches if c["name"]==filtro_coach), None)
+            if cid:
+                q_ext = q_ext.where(
+                    or_(
+                        extra_repasse.c.coach_id == cid,
+                        and_(extra_repasse.c.coach_id.is_(None), student.c.coach_id == cid)
+                    )
+                )
+        rows = conn.execute(q_ext).mappings().all()
+    dfe = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[
+        "id","date","month_ref","description","amount","is_recurring","student_id","coach_id","aluno","professor_name"
+    ])
     if dfe.empty:
         st.info("Nenhum extra para o mês.")
     else:
         dfe["Data"] = pd.to_datetime(dfe["date"]).dt.strftime("%d/%m/%Y")
         dfe["Valor (R$)"] = dfe["amount"].apply(fmt_money)
-        # map coach name
-        if "coach_id" in dfe.columns:
-            dfe["Professor"] = dfe["coach_id"].apply(lambda v: coach_map.get(int(v)) if pd.notna(v) else "")
-        else:
-            dfe["Professor"] = ""
-        st.dataframe(
-            dfe[["Data","month_ref","description","Valor (R$)","is_recurring","student_id","Professor"]]
-            .rename(columns={"month_ref":"Ref.","description":"Descrição","is_recurring":"Recorrente?","student_id":"Aluno ID"}),
-            use_container_width=True, hide_index=True
-        )
+        tabela = dfe[["Data","month_ref","description","Valor (R$)","is_recurring","aluno","professor_name"]]\
+            .rename(columns={"month_ref":"Ref.","description":"Descrição","is_recurring":"Recorrente?","aluno":"Aluno","professor_name":"Professor"})
+        st.dataframe(tabela, use_container_width=True, hide_index=True)
 
-        ids_del = st.multiselect("Excluir extras", options=dfe["id"].tolist(), format_func=lambda i: f"ID {i}")
+        def label_extra(eid: int) -> str:
+            r = dfe.loc[dfe["id"]==eid].iloc[0]
+            return f"{r['Data']} — {r['Descrição'] if 'Descrição' in r else r['description']} — {fmt_money(r['amount'])}"
+
+        ids_del = st.multiselect("Excluir extras", options=dfe["id"].tolist(),
+                                 format_func=lambda i: f"{dfe.loc[dfe['id']==i,'Data'].values[0]} — {dfe.loc[dfe['id']==i,'description'].values[0]}")
         if st.button("🗑️ Excluir selecionados"):
             try:
                 with engine.begin() as conn:
@@ -733,6 +772,7 @@ def page_relatorios(role: str):
     month = st.text_input("Mês (AAAA-MM)", value=this_month_ref())
 
     with engine.begin() as conn:
+        # Pagamentos
         q = (select(payment, student.c.name.label("aluno"),
                     student.c.birth_date, student.c.start_date, student.c.grade)
              .join(student, student.c.id==payment.c.student_id)
@@ -741,23 +781,63 @@ def page_relatorios(role: str):
             cid = next((c["id"] for c in coaches if c["name"]==cfilter), None)
             if cid: q = q.where(student.c.coach_id==cid)
         p_rows = conn.execute(q.order_by(student.c.name)).mappings().all()
-        e_rows = conn.execute(select(extra_repasse).where(extra_repasse.c.month_ref==month)
-                              .order_by(extra_repasse.c.date)).mappings().all()
+
+        # Extras (com filtro por professor direto OU herdado do aluno)
+        q_extra = (
+            select(
+                extra_repasse.c.id,
+                extra_repasse.c.date,
+                extra_repasse.c.month_ref,
+                extra_repasse.c.description,
+                extra_repasse.c.amount,
+                extra_repasse.c.is_recurring,
+                extra_repasse.c.student_id,
+                extra_repasse.c.coach_id,
+                student.c.name.label("aluno"),
+                coach.c.name.label("professor_name"),
+            )
+            .select_from(
+                extra_repasse
+                .outerjoin(student, extra_repasse.c.student_id == student.c.id)
+                .outerjoin(coach, extra_repasse.c.coach_id == coach.c.id)
+            )
+            .where(extra_repasse.c.month_ref == month)
+            .order_by(extra_repasse.c.date)
+        )
+        if cfilter != "(todos)":
+            cid = next((c["id"] for c in coaches if c["name"] == cfilter), None)
+            if cid:
+                q_extra = q_extra.where(
+                    or_(
+                        extra_repasse.c.coach_id == cid,
+                        and_(extra_repasse.c.coach_id.is_(None), student.c.coach_id == cid)
+                    )
+                )
+        e_rows = conn.execute(q_extra).mappings().all()
 
     pag = pd.DataFrame(p_rows) if p_rows else pd.DataFrame(columns=[c.name for c in payment.c] + ["aluno","birth_date","start_date","grade"])
-    ext = pd.DataFrame(e_rows) if e_rows else pd.DataFrame(columns=[c.name for c in extra_repasse.c])
+    ext = pd.DataFrame(e_rows) if e_rows else pd.DataFrame(columns=[
+        "id","date","month_ref","description","amount","is_recurring","student_id","coach_id","aluno","professor_name"
+    ])
 
+    # Mensalidades
     st.subheader("Mensalidades (alunos)")
     if pag.empty:
         st.info("Sem pagamentos no mês."); total_rep = 0.0
     else:
         def idade(dt: Optional[date]) -> str:
-            if not dt: return "-"
+            if not dt or pd.isna(dt): return "-"
+            if isinstance(dt, str): 
+                try: dt = pd.to_datetime(dt).date()
+                except Exception: return "-"
             today = TODAY
             y = today.year - dt.year - ((today.month, today.day) < (dt.month, dt.day))
             return f"{y} anos"
         def tempo_treino(sd: Optional[date]) -> str:
-            if not sd: return "-"
+            if not sd or pd.isna(sd): return "-"
+            if isinstance(sd, str): 
+                try: sd = pd.to_datetime(sd).date()
+                except Exception: return "-"
             total_months = (TODAY.year - sd.year)*12 + (TODAY.month - sd.month)
             if total_months < 12: return f"{total_months} meses"
             anos, meses = divmod(total_months, 12)
@@ -774,18 +854,20 @@ def page_relatorios(role: str):
         total_rep = float(pag["master_amount"].astype(float).sum())
         st.metric("Total de repasse (mensalidades)", fmt_money(total_rep))
 
+    # Extras
     st.subheader("Extras (detalhado)")
     if ext.empty:
         st.info("Sem extras no mês."); total_ext = 0.0
     else:
         ext["Data"] = pd.to_datetime(ext["date"]).dt.strftime("%d/%m/%Y")
         ext["Valor (R$)"] = ext["amount"].apply(fmt_money)
-        st.dataframe(ext[["date","description","amount","is_recurring","student_id","month_ref","coach_id"]]
-                     .rename(columns={"date":"Data","description":"Descrição","amount":"Valor (R$)","is_recurring":"Recorrente?","student_id":"Aluno ID","month_ref":"Ref.","coach_id":"Professor ID"}),
+        st.dataframe(ext[["Data","month_ref","description","Valor (R$)","is_recurring","aluno","professor_name"]] \
+                     .rename(columns={"month_ref":"Ref.","description":"Descrição","is_recurring":"Recorrente?","aluno":"Aluno","professor_name":"Professor"}),
                      use_container_width=True, hide_index=True)
         total_ext = float(ext["amount"].astype(float).sum())
         st.metric("Total (extras)", fmt_money(total_ext))
 
+    # Total geral
     st.subheader("Total geral (repasse + extras)")
     total_geral = (locals().get("total_rep",0.0) or 0.0) + (locals().get("total_ext",0.0) or 0.0)
     st.metric("Total geral (a repassar)", fmt_money(total_geral))
@@ -827,7 +909,7 @@ def page_config(role: str):
     dfc = pd.DataFrame(fetch_coaches())
     if not dfc.empty:
         dfc["Full pass?"] = dfc["full_pass"].map({True:"Sim", False:"Não"})
-        # ID oculto: mostramos só Nome e Full pass?
+        # ocultar ID
         st.dataframe(dfc[["name","Full pass?"]].rename(columns={"name":"Nome"}),
                      use_container_width=True, hide_index=True)
 
