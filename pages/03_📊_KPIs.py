@@ -82,7 +82,11 @@ def ensure_datetime(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_all(engine: Engine) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def fetch_all() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Carrega tabelas necessárias para KPIs, sem receber Engine (evita UnhashableParamError).
+    """
+    engine = get_engine()
     with engine.connect() as con:
         students = pd.read_sql(text("""
             SELECT id, name, birth_date, start_date, active, monthly_fee, coach_id, train_slot_id
@@ -228,8 +232,7 @@ def monthly_projection(series: pd.Series) -> pd.Series:
 # -----------------------------
 st.title("📊 KPIs — JAT (Gestão de Alunos)")
 
-engine = get_engine()
-students, coaches, payments, extras, graduations, train_slots = fetch_all(engine)
+students, coaches, payments, extras, graduations, train_slots = fetch_all()
 students = attach_latest_grade(students, graduations)
 students = enrich_dims(students, coaches, train_slots)
 
