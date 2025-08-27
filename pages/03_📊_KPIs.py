@@ -1,5 +1,5 @@
 # pages/03_📊_KPIs.py
-# JAT - KPIs e gráficos (página independente, sem alterar telas existentes)
+# JAT - KPIs e gráficos (página independente, com guarda de login e fallback para dependências)
 
 from __future__ import annotations
 import os
@@ -9,8 +9,32 @@ from typing import Optional, Tuple
 
 import pandas as pd
 import numpy as np
-import plotly.express as px
 import streamlit as st
+
+# --------- GUARDA DE LOGIN (bloqueia acesso sem autenticar) ----------
+# No seu fluxo de login (tela principal), após autenticar, faça:
+#   st.session_state["auth_ok"] = True
+#   st.session_state["role"] = "admin"  ou  "viewer"
+if not st.session_state.get("auth_ok", False):
+    st.warning("🔒 Faça login para acessar os KPIs.")
+    st.stop()
+# (Opcional) Você pode restringir por perfil:
+# role = st.session_state.get("role", "viewer")
+# if role not in ("admin", "viewer"):
+#     st.error("Permissão insuficiente.")
+#     st.stop()
+
+# --------- Import do Plotly com tratamento amigável ----------
+try:
+    import plotly.express as px
+except ModuleNotFoundError:
+    st.error(
+        "A biblioteca **plotly** não está instalada.\n\n"
+        "• No Streamlit Cloud: adicione `plotly` ao `requirements.txt` e reimplante.\n"
+        "• Localmente: `pip install -U plotly` dentro do seu venv."
+    )
+    st.stop()
+
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
@@ -19,19 +43,17 @@ from sqlalchemy.engine import Engine
 # -----------------------------
 st.set_page_config(page_title="JAT - KPIs", page_icon="📊", layout="wide")
 
-# Paleta sugerida (tema JAT)
+# Paleta (tema JAT)
 JAT_RED = "#D32F2F"
 JAT_ORANGE = "#F57C00"
 JAT_YELLOW = "#FBC02D"
 JAT_BLACK = "#000000"
-JAT_GREY = "#F5F5F5"
 
 # -----------------------------
 # Conexão com o banco
 # -----------------------------
 @st.cache_resource(show_spinner=False)
 def get_engine() -> Engine:
-    # Tenta pegar do secrets, depois da env var; se nada, erro claro
     db_url = (
         st.secrets.get("DATABASE_URL", None)
         if hasattr(st, "secrets") else None
@@ -44,7 +66,6 @@ def get_engine() -> Engine:
         )
         st.stop()
 
-    # Psycopg v3 (postgresql+psycopg) ou qualquer outro driver compatível
     connect_args = {}
     if db_url.startswith("postgresql"):
         connect_args["connect_timeout"] = 10
@@ -58,7 +79,6 @@ def get_engine() -> Engine:
     )
     return engine
 
-
 # -----------------------------
 # Utilitários
 # -----------------------------
@@ -71,14 +91,11 @@ def brl(x: Optional[float]) -> str:
     except Exception:
         return "R$ 0,00"
 
-
 def year_month(d: pd.Series | pd.DatetimeIndex) -> pd.Series:
-    return pd.to_datetime(d).dt.to_period("M").astype(str)  # "YYYY-MM"
-
+    return pd.to_datetime(d, errors="coerce").dt.to_period("M").astype(str)  # "YYYY-MM"
 
 def ensure_datetime(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
-
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_all(engine: Engine) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -87,7 +104,6 @@ def fetch_all(engine: Engine) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame,
     Retorna: students, coaches, payments, extras, graduations, train_slots
     """
     with engine.connect() as con:
-        # Tabelas principais (ajuste nomes se diferente no seu banco)
         students = pd.read_sql(text("""
             SELECT id, name, birth_date, start_date, active, monthly_fee, coach_id, train_slot_id
             FROM student
@@ -123,7 +139,7 @@ def fetch_all(engine: Engine) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame,
             FROM train_slot
         """), con)
 
-    # Normalizações de tipos e colunas úteis
+    # Normalizações
     if not students.empty:
         students["birth_date"] = ensure_datetime(students["birth_date"]).dt.date
         students["start_date"] = ensure_datetime(students["start_date"]).dt.date
@@ -146,7 +162,6 @@ def fetch_all(engine: Engine) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame,
 
     return students, coaches, payments, extras, graduations, train_slots
 
-
 def attach_latest_grade(students: pd.DataFrame, graduations: pd.DataFrame) -> pd.DataFrame:
     """Anexa graduação mais recente ao DF de alunos."""
     if graduations.empty or students.empty:
@@ -165,14 +180,12 @@ def attach_latest_grade(students: pd.DataFrame, graduations: pd.DataFrame) -> pd
     out.drop(columns=["student_id"], inplace=True, errors="ignore")
     return out
 
-
 def enrich_dims(students: pd.DataFrame, coaches: pd.DataFrame, train_slots: pd.DataFrame) -> pd.DataFrame:
-    """Adiciona nomes de coach/slot e campos de idade/tempo de treino (hoje)."""
+    """Adiciona nomes de coach/slot e campos de idade/tempo (hoje)."""
     df = students.copy()
     df = df.merge(coaches.rename(columns={"id": "coach_id", "name": "coach_name"}), on="coach_id", how="left")
     df = df.merge(train_slots.rename(columns={"id": "train_slot_id", "name": "train_slot_name"}), on="train_slot_id", how="left")
 
-    # Idade hoje (anos) e tempo de treino (meses/anosemeses)
     today = dt.date.today()
 
     def idade_anos(nasc: Optional[dt.date]) -> Optional[int]:
@@ -199,7 +212,6 @@ def enrich_dims(students: pd.DataFrame, coaches: pd.DataFrame, train_slots: pd.D
     df["tempo_str"] = df["tempo_meses"].apply(anos_meses_str)
     return df
 
-
 def apply_filters(
     students: pd.DataFrame,
     payments: pd.DataFrame,
@@ -209,7 +221,6 @@ def apply_filters(
     date_end: dt.date
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Filtra pagamentos e extras por data e professor."""
-    # Pagamentos: filtro por faixa de data e por professor (via aluno)
     p = payments.copy()
     if not p.empty:
         p = p[(p["paid_date"] >= date_start) & (p["paid_date"] <= date_end)]
@@ -217,7 +228,6 @@ def apply_filters(
             stus = students.loc[students["coach_id"] == coach_id, "id"].tolist()
             p = p[p["student_id"].isin(stus)]
 
-    # Extras: se tiver coach_id na própria linha, usa direto; caso contrário, filtra via aluno
     e = extras.copy()
     if not e.empty:
         e = e[(e["date"] >= date_start) & (e["date"] <= date_end)]
@@ -231,18 +241,13 @@ def apply_filters(
 
     return p, e
 
-
 def monthly_projection(series: pd.Series) -> pd.Series:
-    """
-    Projeta valores ausentes usando média dos meses que têm valor.
-    Entrada/saída: série indexada por YearMonth (string) com valores numéricos ou NaN.
-    """
+    """Preenche meses sem valor com a média dos meses que possuem valor."""
     s = series.copy()
     if s.dropna().empty:
-        return s.fillna(0.0)  # sem histórico: projeta 0
+        return s.fillna(0.0)
     media = s.dropna().mean()
     return s.fillna(media)
-
 
 # -----------------------------
 # UI - Filtros
@@ -283,7 +288,7 @@ with st.form("filtros_kpi"):
 if not submitted:
     st.stop()
 
-# Aplica filtros aos fatos
+# Aplica filtros
 p_fil, e_fil = apply_filters(students, payments, extras, coach_id, date_start, date_end)
 
 # -----------------------------
@@ -303,56 +308,51 @@ k4.metric("Lucro (Real)", brl(lucro))
 st.divider()
 
 # -----------------------------
-# Séries mensais: Ativos, Receita vs Projetada, Lucro vs Projetado
+# Séries mensais
 # -----------------------------
-# Monta calendário mensal no intervalo
 cal = pd.period_range(pd.Period(date_start, freq="M"), pd.Period(date_end, freq="M"), freq="M").astype(str)
 
-# 1) Alunos ativos (pagaram no mês)
+# 1) Ativos por mês
 ativos_mes = (
     p_fil.assign(YearMonth=year_month(pd.to_datetime(p_fil["paid_date"])))
     .groupby("YearMonth")["student_id"].nunique()
     if not p_fil.empty else pd.Series(dtype=float)
 ).reindex(cal).fillna(0).astype(int)
 
-# 2) Receita real mensal
+# 2) Receita mensal
 receita_mes = (
     p_fil.assign(YearMonth=year_month(pd.to_datetime(p_fil["paid_date"])))
     .groupby("YearMonth")["amount"].sum()
     if not p_fil.empty else pd.Series(dtype=float)
 ).reindex(cal).astype(float)
 
-# 3) Lucro real mensal
-lucro_mes = (
+# 3) Repasse mensal
+repasse_mes = (
     p_fil.assign(YearMonth=year_month(pd.to_datetime(p_fil["paid_date"])))
-       .groupby("YearMonth")
-       .apply(lambda df: float(df["amount"].sum() - df["master_amount"].sum()))
+    .groupby("YearMonth")["master_amount"].sum()
     if not p_fil.empty else pd.Series(dtype=float)
 ).reindex(cal).astype(float)
 
-# 4) Extras mensais
+# 4) Lucro mensal (real)
+lucro_mes = (receita_mes.fillna(0) - repasse_mes.fillna(0)).astype(float)
+
+# 5) Extras mensais
 extras_mes = (
     e_fil.assign(YearMonth=year_month(pd.to_datetime(e_fil["date"])))
     .groupby("YearMonth")["amount"].sum()
     if not e_fil.empty else pd.Series(dtype=float)
 ).reindex(cal).astype(float)
 
-# Receita projetada: preenche meses sem receita pela média dos meses com valor
+# Projeções
 receita_proj = monthly_projection(receita_mes)
-
-# Lucro projetado: usa lucro real se houver, senão média dos meses com valor
 lucro_proj = monthly_projection(lucro_mes)
 
 # -----------------------------
 # Gráficos
 # -----------------------------
 st.subheader("Alunos ativos (pagaram no mês)")
-
 df_ativos = pd.DataFrame({"Mês": cal, "Ativos": ativos_mes.values})
-fig1 = px.bar(
-    df_ativos, x="Mês", y="Ativos",
-    title=None, color_discrete_sequence=[JAT_RED]
-)
+fig1 = px.bar(df_ativos, x="Mês", y="Ativos", title=None, color_discrete_sequence=[JAT_RED])
 fig1.update_layout(margin=dict(l=10,r=10,t=10,b=10), xaxis_title=None, yaxis_title=None)
 st.plotly_chart(fig1, use_container_width=True)
 
@@ -396,13 +396,11 @@ st.subheader("Detalhes (tabelas)")
 t1, t2 = st.tabs(["💳 Pagamentos (mês a mês)", "🧾 Extras (mês a mês)"])
 
 with t1:
-    df_pag = pd.DataFrame({"Mês": cal, "Receita (R$)": receita_mes.fillna(0).values,
-                           "Repasse (R$)": (
-                               p_fil.assign(YearMonth=year_month(pd.to_datetime(p_fil["paid_date"])))
-                                  .groupby("YearMonth")["master_amount"].sum()
-                               if not p_fil.empty else pd.Series(dtype=float)
-                           ).reindex(cal).fillna(0).values
-                          })
+    df_pag = pd.DataFrame({
+        "Mês": cal,
+        "Receita (R$)": receita_mes.fillna(0).values,
+        "Repasse (R$)": repasse_mes.fillna(0).values
+    })
     df_pag["Lucro (R$)"] = df_pag["Receita (R$)"] - df_pag["Repasse (R$)"]
     st.dataframe(df_pag, use_container_width=True)
     st.download_button(
