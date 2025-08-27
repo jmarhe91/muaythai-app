@@ -4,3 +4,8 @@ sqlalchemy>=2.0
 pandas>=2.2
 python-dateutil>=2.9
 psycopg[binary]>=3.2
+plotly>=5.22
+
+
+
+
