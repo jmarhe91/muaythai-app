@@ -1,5 +1,5 @@
 # pages/03_📊_KPIs.py
-# JAT - KPIs e gráficos (página independente, com guarda de login e fallback para dependências)
+# KPIs e gráficos (com guarda de login e filtros em form)
 
 from __future__ import annotations
 import os
@@ -11,46 +11,41 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 
-# --------- GUARDA DE LOGIN (bloqueia acesso sem autenticar) ----------
-# No seu fluxo de login (tela principal), após autenticar, faça:
-#   st.session_state["auth_ok"] = True
-#   st.session_state["role"] = "admin"  ou  "viewer"
-if not st.session_state.get("auth_ok", False):
+# --------- GUARDA DE LOGIN ----------
+def is_logged_in() -> bool:
+    ss = st.session_state
+    return bool(
+        ss.get("auth_ok") or
+        ss.get("logged_in") or
+        (ss.get("role") in ("admin", "viewer")) or
+        ss.get("user")
+    )
+
+PUBLIC_KPIS = (os.getenv("PUBLIC_KPIS") == "1") or bool(getattr(st, "secrets", {}).get("PUBLIC_KPIS", False))
+if not is_logged_in() and not PUBLIC_KPIS:
     st.warning("🔒 Faça login para acessar os KPIs.")
     st.stop()
-# (Opcional) Você pode restringir por perfil:
-# role = st.session_state.get("role", "viewer")
-# if role not in ("admin", "viewer"):
-#     st.error("Permissão insuficiente.")
-#     st.stop()
 
-# --------- Import do Plotly com tratamento amigável ----------
+# --------- PLOTLY ----------
 try:
     import plotly.express as px
 except ModuleNotFoundError:
-    st.error(
-        "A biblioteca **plotly** não está instalada.\n\n"
-        "• No Streamlit Cloud: adicione `plotly` ao `requirements.txt` e reimplante.\n"
-        "• Localmente: `pip install -U plotly` dentro do seu venv."
-    )
+    st.error("A biblioteca **plotly** não está instalada. Adicione `plotly` ao `requirements.txt`.")
     st.stop()
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-# -----------------------------
-# Configuração básica da página
-# -----------------------------
 st.set_page_config(page_title="JAT - KPIs", page_icon="📊", layout="wide")
 
-# Paleta (tema JAT)
+# Paleta JAT
 JAT_RED = "#D32F2F"
 JAT_ORANGE = "#F57C00"
 JAT_YELLOW = "#FBC02D"
 JAT_BLACK = "#000000"
 
 # -----------------------------
-# Conexão com o banco
+# Conexão
 # -----------------------------
 @st.cache_resource(show_spinner=False)
 def get_engine() -> Engine:
@@ -60,28 +55,17 @@ def get_engine() -> Engine:
     ) or os.getenv("DATABASE_URL", None)
 
     if not db_url:
-        st.error(
-            "DATABASE_URL não configurado. Defina em `.streamlit/secrets.toml` "
-            "ou na variável de ambiente `DATABASE_URL`."
-        )
+        st.error("DATABASE_URL não configurado em secrets ou env.")
         st.stop()
 
     connect_args = {}
     if db_url.startswith("postgresql"):
         connect_args["connect_timeout"] = 10
 
-    engine = create_engine(
-        db_url,
-        pool_pre_ping=True,
-        pool_size=5,
-        max_overflow=5,
-        connect_args=connect_args
+    return create_engine(
+        db_url, pool_pre_ping=True, pool_size=5, max_overflow=5, connect_args=connect_args
     )
-    return engine
 
-# -----------------------------
-# Utilitários
-# -----------------------------
 def brl(x: Optional[float]) -> str:
     if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
         return "R$ 0,00"
@@ -92,17 +76,13 @@ def brl(x: Optional[float]) -> str:
         return "R$ 0,00"
 
 def year_month(d: pd.Series | pd.DatetimeIndex) -> pd.Series:
-    return pd.to_datetime(d, errors="coerce").dt.to_period("M").astype(str)  # "YYYY-MM"
+    return pd.to_datetime(d, errors="coerce").dt.to_period("M").astype(str)
 
 def ensure_datetime(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_all(engine: Engine) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Carrega tabelas mínimas necessárias para KPIs.
-    Retorna: students, coaches, payments, extras, graduations, train_slots
-    """
     with engine.connect() as con:
         students = pd.read_sql(text("""
             SELECT id, name, birth_date, start_date, active, monthly_fee, coach_id, train_slot_id
@@ -163,7 +143,6 @@ def fetch_all(engine: Engine) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame,
     return students, coaches, payments, extras, graduations, train_slots
 
 def attach_latest_grade(students: pd.DataFrame, graduations: pd.DataFrame) -> pd.DataFrame:
-    """Anexa graduação mais recente ao DF de alunos."""
     if graduations.empty or students.empty:
         students["latest_grade"] = "Branca"
         students["latest_grade_date"] = pd.NaT
@@ -176,12 +155,10 @@ def attach_latest_grade(students: pd.DataFrame, graduations: pd.DataFrame) -> pd
     )
     out = students.merge(g_latest, left_on="id", right_on="student_id", how="left")
     out["latest_grade"] = out["latest_grade"].fillna("Branca")
-    out["latest_grade_date"] = out["latest_grade_date"]
     out.drop(columns=["student_id"], inplace=True, errors="ignore")
     return out
 
 def enrich_dims(students: pd.DataFrame, coaches: pd.DataFrame, train_slots: pd.DataFrame) -> pd.DataFrame:
-    """Adiciona nomes de coach/slot e campos de idade/tempo (hoje)."""
     df = students.copy()
     df = df.merge(coaches.rename(columns={"id": "coach_id", "name": "coach_name"}), on="coach_id", how="left")
     df = df.merge(train_slots.rename(columns={"id": "train_slot_id", "name": "train_slot_name"}), on="train_slot_id", how="left")
@@ -220,7 +197,6 @@ def apply_filters(
     date_start: dt.date,
     date_end: dt.date
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Filtra pagamentos e extras por data e professor."""
     p = payments.copy()
     if not p.empty:
         p = p[(p["paid_date"] >= date_start) & (p["paid_date"] <= date_end)]
@@ -238,11 +214,9 @@ def apply_filters(
                 stus = students.loc[students["coach_id"] == coach_id, "id"].tolist()
                 if "student_id" in e.columns:
                     e = e[e["student_id"].isin(stus)]
-
     return p, e
 
 def monthly_projection(series: pd.Series) -> pd.Series:
-    """Preenche meses sem valor com a média dos meses que possuem valor."""
     s = series.copy()
     if s.dropna().empty:
         return s.fillna(0.0)
@@ -250,7 +224,7 @@ def monthly_projection(series: pd.Series) -> pd.Series:
     return s.fillna(media)
 
 # -----------------------------
-# UI - Filtros
+# UI
 # -----------------------------
 st.title("📊 KPIs — JAT (Gestão de Alunos)")
 
@@ -259,7 +233,6 @@ students, coaches, payments, extras, graduations, train_slots = fetch_all(engine
 students = attach_latest_grade(students, graduations)
 students = enrich_dims(students, coaches, train_slots)
 
-# Range de datas padrão
 min_date_candidates = []
 if not payments.empty:
     min_date_candidates.append(pd.to_datetime(payments["paid_date"]).min())
@@ -288,12 +261,10 @@ with st.form("filtros_kpi"):
 if not submitted:
     st.stop()
 
-# Aplica filtros
+# Fatos filtrados
 p_fil, e_fil = apply_filters(students, payments, extras, coach_id, date_start, date_end)
 
-# -----------------------------
-# KPIs (cards)
-# -----------------------------
+# KPIs
 receita = float(p_fil["amount"].sum()) if not p_fil.empty else 0.0
 repasse = float(p_fil["master_amount"].sum()) if not p_fil.empty else 0.0
 extras_liq = float(e_fil["amount"].sum()) if not e_fil.empty else 0.0
@@ -307,52 +278,42 @@ k4.metric("Lucro (Real)", brl(lucro))
 
 st.divider()
 
-# -----------------------------
 # Séries mensais
-# -----------------------------
 cal = pd.period_range(pd.Period(date_start, freq="M"), pd.Period(date_end, freq="M"), freq="M").astype(str)
 
-# 1) Ativos por mês
 ativos_mes = (
     p_fil.assign(YearMonth=year_month(pd.to_datetime(p_fil["paid_date"])))
     .groupby("YearMonth")["student_id"].nunique()
     if not p_fil.empty else pd.Series(dtype=float)
 ).reindex(cal).fillna(0).astype(int)
 
-# 2) Receita mensal
 receita_mes = (
     p_fil.assign(YearMonth=year_month(pd.to_datetime(p_fil["paid_date"])))
     .groupby("YearMonth")["amount"].sum()
     if not p_fil.empty else pd.Series(dtype=float)
 ).reindex(cal).astype(float)
 
-# 3) Repasse mensal
 repasse_mes = (
     p_fil.assign(YearMonth=year_month(pd.to_datetime(p_fil["paid_date"])))
     .groupby("YearMonth")["master_amount"].sum()
     if not p_fil.empty else pd.Series(dtype=float)
 ).reindex(cal).astype(float)
 
-# 4) Lucro mensal (real)
 lucro_mes = (receita_mes.fillna(0) - repasse_mes.fillna(0)).astype(float)
 
-# 5) Extras mensais
 extras_mes = (
     e_fil.assign(YearMonth=year_month(pd.to_datetime(e_fil["date"])))
     .groupby("YearMonth")["amount"].sum()
     if not e_fil.empty else pd.Series(dtype=float)
 ).reindex(cal).astype(float)
 
-# Projeções
 receita_proj = monthly_projection(receita_mes)
 lucro_proj = monthly_projection(lucro_mes)
 
-# -----------------------------
 # Gráficos
-# -----------------------------
 st.subheader("Alunos ativos (pagaram no mês)")
 df_ativos = pd.DataFrame({"Mês": cal, "Ativos": ativos_mes.values})
-fig1 = px.bar(df_ativos, x="Mês", y="Ativos", title=None, color_discrete_sequence=[JAT_RED])
+fig1 = px.bar(df_ativos, x="Mês", y="Ativos", title=None, color_discrete_sequence=["#D32F2F"])
 fig1.update_layout(margin=dict(l=10,r=10,t=10,b=10), xaxis_title=None, yaxis_title=None)
 st.plotly_chart(fig1, use_container_width=True)
 
@@ -365,9 +326,9 @@ with cA:
         "Receita (Real)": receita_mes.fillna(0).values,
         "Receita (Projetada)": receita_proj.fillna(0).values
     })
-    fig2 = px.bar(df_rec, x="Mês", y="Receita (Real)", color_discrete_sequence=[JAT_BLACK])
+    fig2 = px.bar(df_rec, x="Mês", y="Receita (Real)", color_discrete_sequence=["#000000"])
     fig2.add_scatter(x=df_rec["Mês"], y=df_rec["Receita (Projetada)"], name="Projetada", mode="lines+markers",
-                     line=dict(color=JAT_ORANGE))
+                     line=dict(color="#F57C00"))
     fig2.update_layout(margin=dict(l=10,r=10,t=10,b=10), xaxis_title=None, yaxis_title=None, legend_title=None)
     fig2.update_yaxes(tickprefix="R$ ")
     st.plotly_chart(fig2, use_container_width=True)
@@ -379,20 +340,17 @@ with cB:
         "Lucro (Real)": lucro_mes.fillna(0).values,
         "Lucro (Projetado)": lucro_proj.fillna(0).values
     })
-    fig3 = px.bar(df_luc, x="Mês", y="Lucro (Real)", color_discrete_sequence=[JAT_RED])
+    fig3 = px.bar(df_luc, x="Mês", y="Lucro (Real)", color_discrete_sequence=["#D32F2F"])
     fig3.add_scatter(x=df_luc["Mês"], y=df_luc["Lucro (Projetado)"], name="Projetado", mode="lines+markers",
-                     line=dict(color=JAT_YELLOW))
+                     line=dict(color="#FBC02D"))
     fig3.update_layout(margin=dict(l=10,r=10,t=10,b=10), xaxis_title=None, yaxis_title=None, legend_title=None)
     fig3.update_yaxes(tickprefix="R$ ")
     st.plotly_chart(fig3, use_container_width=True)
 
 st.divider()
 
-# -----------------------------
-# Tabelas detalhadas + export
-# -----------------------------
+# Tabelas + export
 st.subheader("Detalhes (tabelas)")
-
 t1, t2 = st.tabs(["💳 Pagamentos (mês a mês)", "🧾 Extras (mês a mês)"])
 
 with t1:
