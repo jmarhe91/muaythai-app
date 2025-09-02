@@ -358,7 +358,7 @@ def page_alunos(role: str):
                 submit_bulk = st.form_submit_button(
                     "✅ Confirmar alteração",
                     type="primary" )
-                )
+                
 
             if submit_bulk:
                 ids = [options_map[s] for s in sel]
