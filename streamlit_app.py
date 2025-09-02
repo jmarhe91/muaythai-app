@@ -160,7 +160,7 @@ extra_repasse = Table(
     Column("amount", Numeric(12,2), nullable=False),  # pode ser negativo
     Column("is_recurring", Boolean, nullable=False, server_default="false"),
     Column("student_id", Integer, ForeignKey("student.id"), nullable=True),
-    Column("coach_id", Integer, ForeignKey("coach.id"), nullable=True),  # agora sempre usado no filtro
+    Column("coach_id", Integer, ForeignKey("coach.id"), nullable=True),
     Column("created_at", Date, nullable=False, server_default=func.current_date()),
 )
 Index("ix_extra_repasse_month_ref", extra_repasse.c.month_ref)
@@ -189,18 +189,20 @@ def bootstrap_db_if_needed() -> None:
         pass
 
 def ensure_extra_has_coach():
-    """Garante coluna coach_id em extra_repasse (para instalações antigas) e índice, idempotente."""
+    """Garante coluna/índices em extra_repasse (idempotente)."""
     try:
         insp = inspect(engine)
         cols = [c["name"] for c in insp.get_columns("extra_repasse")]
         if "coach_id" not in cols:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE extra_repasse ADD COLUMN coach_id INTEGER NULL"))
+
         with engine.begin() as conn:
-            try:
-                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_extra_repasse_coach_id ON extra_repasse (coach_id)"))
-            except Exception:
-                pass
+            # índices úteis para os filtros
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_extra_repasse_coach_id ON extra_repasse (coach_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_extra_repasse_month_ref ON extra_repasse (month_ref)"))
+            # índice para recorrência + mês (melhora muito as consultas)
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_extra_repasse_rec_mon ON extra_repasse (is_recurring, month_ref)"))
     except Exception:
         pass
 
@@ -280,7 +282,7 @@ def compute_master_percent_for_student(conn: Connection, stu_row: Dict[str, Any]
         percent = float(cfg["master_percent"]) if cfg and cfg.get("master_percent") is not None else 0.6
     return percent
 
-# ===== NOVO: atualização em massa de mensalidades =====
+# ===== Atualização em massa de mensalidades =====
 def update_monthly_fee_bulk(engine: Engine, student_ids: List[int], new_fee: float) -> int:
     """Atualiza mensalidade para todos os IDs informados. Retorna quantidade alterada."""
     if not student_ids:
@@ -317,7 +319,7 @@ def page_alunos(role: str):
         cols = ["name","Status","Nasc.","Início","Mensalidade","Ativo","Graduação","Data grad.","Repasse % (aluno)"]
         st.dataframe(view[cols].rename(columns={"name":"Nome"}), use_container_width=True, hide_index=True)
 
-    # ===== NOVO BLOCO: alterar mensalidades em massa =====
+    # ===== Alterar mensalidades em massa =====
     with st.expander("💰 Alterar mensalidades (em massa)", expanded=False):
         df_all = fetch_students_df()
         if df_all.empty:
@@ -344,7 +346,6 @@ def page_alunos(role: str):
                     if cid is not None:
                         df_sel = df_sel[df_sel["coach_id"] == cid]
 
-                # mapa legível -> id
                 options_map = {
                     f"{row['name']} — {fmt_money(row['monthly_fee'])}": int(row["id"])
                     for _, row in df_sel.sort_values("name").iterrows()
@@ -355,25 +356,26 @@ def page_alunos(role: str):
                     options=list(options_map.keys()),
                     placeholder="Digite para filtrar por nome…"
                 )
-                submit_bulk = st.form_submit_button(
-                    "✅ Confirmar alteração",
-                    type="primary" )
-                
+
+                # Sempre habilitado; validação após o clique
+                submit_bulk = st.form_submit_button("✅ Confirmar alteração", type="primary")
 
             if submit_bulk:
-                ids = [options_map[s] for s in sel]
-                n = update_monthly_fee_bulk(engine, ids, new_fee)
-                invalidate_all_cache()
-                st.success(f"Mensalidade atualizada para **{n}** aluno(s) → {fmt_money(new_fee)}")
-                # prévia do resultado
-                df_ok = fetch_students_df()
-                df_ok = df_ok[df_ok["id"].isin(ids)][["name","monthly_fee"]].rename(
-                    columns={"name": "Aluno", "monthly_fee": "Nova mensalidade (R$)"}
-                )
-                if not df_ok.empty:
-                    df_ok["Nova mensalidade (R$)"] = df_ok["Nova mensalidade (R$)"].apply(fmt_money)
-                    st.dataframe(df_ok, use_container_width=True, hide_index=True)
-    # ===== FIM BLOCO NOVO =====
+                if not sel:
+                    st.warning("Selecione ao menos um aluno.")
+                else:
+                    ids = [options_map[s] for s in sel]
+                    n = update_monthly_fee_bulk(engine, ids, new_fee)
+                    invalidate_all_cache()
+                    st.success(f"Mensalidade atualizada para **{n}** aluno(s) → {fmt_money(new_fee)}")
+                    df_ok = fetch_students_df()
+                    df_ok = df_ok[df_ok["id"].isin(ids)][["name","monthly_fee"]].rename(
+                        columns={"name": "Aluno", "monthly_fee": "Nova mensalidade (R$)"}
+                    )
+                    if not df_ok.empty:
+                        df_ok["Nova mensalidade (R$)"] = df_ok["Nova mensalidade (R$)"].apply(fmt_money)
+                        st.dataframe(df_ok, use_container_width=True, hide_index=True)
+    # ===== Fim bloco =====
 
     # Cadastrar
     with st.expander("➕ Cadastrar novo aluno", expanded=False):
@@ -552,7 +554,7 @@ def page_graduacoes(role: str):
                                     .limit(1)).mappings().first()
                 if last:
                     conn.execute(update(student).where(student.c.id==sid).values(grade=last["grade"], grade_date=last["grade_date"]))
-            invalidate_all_cache(); st.success("✅ Graduação registrado."); st.rerun()
+            invalidate_all_cache(); st.success("✅ Graduação registrada."); st.rerun()
         except SQLAlchemyError as e:
             st.error(f"Erro ao salvar graduação: {e}")
 
@@ -773,6 +775,11 @@ def page_extras(role: str):
     filtro_coach = st.selectbox("Filtrar por professor", ["(todos)"] + [c["name"] for c in coaches], key="extra_filter_coach")
 
     with engine.begin() as conn:
+        # Itens do mês OU recorrentes cujo mês de origem <= mês selecionado
+        cond_mes = (extra_repasse.c.month_ref == m) | (
+            (extra_repasse.c.is_recurring == True) & (extra_repasse.c.month_ref <= m)
+        )
+
         q_ext = (
             select(
                 extra_repasse.c.id,
@@ -789,9 +796,9 @@ def page_extras(role: str):
             .select_from(
                 extra_repasse
                 .outerjoin(student, extra_repasse.c.student_id == student.c.id)
-                .outerjoin(coach, extra_repasse.c.coach_id == coach.c.id)
+                .outerjoin(coach,   extra_repasse.c.coach_id   == coach.c.id)
             )
-            .where(extra_repasse.c.month_ref == m)
+            .where(cond_mes)
             .order_by(extra_repasse.c.date.desc(), extra_repasse.c.id.desc())
         )
         if filtro_coach != "(todos)":
@@ -812,6 +819,7 @@ def page_extras(role: str):
         tabela = dfe[["Data","month_ref","description","Valor (R$)","is_recurring","aluno","professor_name"]]\
             .rename(columns={"month_ref":"Ref.","description":"Descrição","is_recurring":"Recorrente?","aluno":"Aluno","professor_name":"Professor"})
         st.dataframe(tabela, use_container_width=True, hide_index=True)
+        st.caption("Itens com 'Recorrente?' marcado aparecem automaticamente nos meses seguintes.")
 
         ids_del = st.multiselect(
             "Excluir extras",
@@ -844,7 +852,10 @@ def page_relatorios(role: str):
             if cid: q = q.where(student.c.coach_id==cid)
         p_rows = conn.execute(q.order_by(student.c.name)).mappings().all()
 
-        # Extras (filtro só por extra_repasse.coach_id — já backfilled)
+        # Extras (inclui recorrentes cujo month_ref <= month)
+        cond_mes = (extra_repasse.c.month_ref == month) | (
+            (extra_repasse.c.is_recurring == True) & (extra_repasse.c.month_ref <= month)
+        )
         q_extra = (
             select(
                 extra_repasse.c.id,
@@ -861,9 +872,9 @@ def page_relatorios(role: str):
             .select_from(
                 extra_repasse
                 .outerjoin(student, extra_repasse.c.student_id == student.c.id)
-                .outerjoin(coach, extra_repasse.c.coach_id == coach.c.id)
+                .outerjoin(coach,   extra_repasse.c.coach_id   == coach.c.id)
             )
-            .where(extra_repasse.c.month_ref == month)
+            .where(cond_mes)
             .order_by(extra_repasse.c.date)
         )
         if cfilter != "(todos)":
@@ -919,9 +930,11 @@ def page_relatorios(role: str):
     else:
         ext["Data"] = pd.to_datetime(ext["date"]).dt.strftime("%d/%m/%Y")
         ext["Valor (R$)"] = ext["amount"].apply(fmt_money)
-        st.dataframe(ext[{"Data","month_ref","description","Valor (R$)","is_recurring","aluno","professor_name"}] \
-                     .rename(columns={"month_ref":"Ref.","description":"Descrição","is_recurring":"Recorrente?","aluno":"Aluno","professor_name":"Professor"}),
-                     use_container_width=True, hide_index=True)
+        st.dataframe(
+            ext[["Data","month_ref","description","Valor (R$)","is_recurring","aluno","professor_name"]] \
+                .rename(columns={"month_ref":"Ref.","description":"Descrição","is_recurring":"Recorrente?","aluno":"Aluno","professor_name":"Professor"}),
+            use_container_width=True, hide_index=True
+        )
         total_ext = float(ext["amount"].astype(float).sum())
         st.metric("Total (extras)", fmt_money(total_ext))
 
