@@ -318,54 +318,62 @@ def page_alunos(role: str):
         st.dataframe(view[cols].rename(columns={"name":"Nome"}), use_container_width=True, hide_index=True)
 
     # ===== NOVO BLOCO: alterar mensalidades em massa =====
-# --- SUBSTITUA todo o bloco de "Alterar mensalidades (em massa)" por este ---
-
-with st.expander("💰 Alterar mensalidades (em massa)", expanded=False):
-    df_base = fetch_students_df()
-    if df_base.empty:
-        st.info("Sem alunos para alterar.")
-    else:
-        col_a, col_b, col_c = st.columns([1, 1, 1])
-        with col_a:
-            only_active = st.checkbox("Somente ativos", value=True)
-        with col_b:
-            coach_name = st.selectbox("Professor (opcional)", ["(todos)"] + [c["name"] for c in fetch_coaches()])
-        with col_c:
-            novo_valor = st.number_input("Novo valor (R$)", min_value=0.0, step=5.0, value=0.0, format="%.2f")
-
-        # Filtro
-        df_filt = df_base.copy()
-        if only_active:
-            df_filt = df_filt[df_filt["active"] == True]
-        if coach_name != "(todos)":
-            cid = next((c["id"] for c in fetch_coaches() if c["name"] == coach_name), None)
-            if cid is not None:
-                df_filt = df_filt[df_filt["coach_id"] == cid]
-
-        sel_ids = st.multiselect(
-            "Selecione os alunos",
-            options=df_filt["id"].tolist(),
-            format_func=lambda i: df_filt.loc[df_filt["id"] == i, "name"].values[0]
-        )
-
-        # Habilita o botão somente quando há seleção e valor
-        pode_enviar = (len(sel_ids) > 0) and (novo_valor is not None)
-        bt = st.button("✅ Confirmar alteração", disabled=not pode_enviar)
-
-        if bt:
-            try:
-                with engine.begin() as conn:
-                    conn.execute(
-                        update(student)
-                        .where(student.c.id.in_(sel_ids))
-                        .values(monthly_fee=float(novo_valor))
+    with st.expander("💰 Alterar mensalidades (em massa)", expanded=False):
+        df_all = fetch_students_df()
+        if df_all.empty:
+            st.info("Sem alunos para alterar.")
+        else:
+            coaches = fetch_coaches()
+            with st.form("form_bulk_fee"):
+                c1, c2, c3 = st.columns([1,1,2])
+                with c1:
+                    only_active = st.checkbox("Somente ativos", value=True)
+                with c2:
+                    coach_filter = st.selectbox(
+                        "Professor (opcional)",
+                        ["(todos)"] + [c["name"] for c in coaches]
                     )
-                invalidate_all_cache()
-                st.success(f"Mensalidade atualizada para {len(sel_ids)} aluno(s) em {fmt_money(novo_valor)}.")
-                st.rerun()
-            except SQLAlchemyError as e:
-                st.error(f"Erro ao atualizar: {e}")
+                with c3:
+                    new_fee = st.number_input("Novo valor (R$)", min_value=0.0, step=10.0, format="%.2f")
 
+                df_sel = df_all.copy()
+                if only_active:
+                    df_sel = df_sel[df_sel["active"] == True]
+                if coach_filter != "(todos)":
+                    cid = next((c["id"] for c in coaches if c["name"] == coach_filter), None)
+                    if cid is not None:
+                        df_sel = df_sel[df_sel["coach_id"] == cid]
+
+                # mapa legível -> id
+                options_map = {
+                    f"{row['name']} — {fmt_money(row['monthly_fee'])}": int(row["id"])
+                    for _, row in df_sel.sort_values("name").iterrows()
+                }
+
+                sel = st.multiselect(
+                    "Selecione os alunos",
+                    options=list(options_map.keys()),
+                    placeholder="Digite para filtrar por nome…"
+                )
+                submit_bulk = st.form_submit_button(
+                    "✅ Confirmar alteração",
+                    type="primary",
+                     new_fee <= 0)
+                )
+
+            if submit_bulk:
+                ids = [options_map[s] for s in sel]
+                n = update_monthly_fee_bulk(engine, ids, new_fee)
+                invalidate_all_cache()
+                st.success(f"Mensalidade atualizada para **{n}** aluno(s) → {fmt_money(new_fee)}")
+                # prévia do resultado
+                df_ok = fetch_students_df()
+                df_ok = df_ok[df_ok["id"].isin(ids)][["name","monthly_fee"]].rename(
+                    columns={"name": "Aluno", "monthly_fee": "Nova mensalidade (R$)"}
+                )
+                if not df_ok.empty:
+                    df_ok["Nova mensalidade (R$)"] = df_ok["Nova mensalidade (R$)"].apply(fmt_money)
+                    st.dataframe(df_ok, use_container_width=True, hide_index=True)
     # ===== FIM BLOCO NOVO =====
 
     # Cadastrar
