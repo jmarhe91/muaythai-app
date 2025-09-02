@@ -358,7 +358,7 @@ def page_alunos(role: str):
                 submit_bulk = st.form_submit_button(
                     "✅ Confirmar alteração",
                     type="primary",
-                     new_fee <= 0)
+                    disabled=(new_fee <= 0)
                 )
 
             if submit_bulk:
